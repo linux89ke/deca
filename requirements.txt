@@ -1,1 +1,8 @@
 streamlit
+pandas
+numpy
+requests
+Pillow
+openpyxl
+scikit-learn
+groq

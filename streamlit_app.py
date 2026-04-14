@@ -285,7 +285,7 @@ def rule_based_short_desc(row: pd.Series) -> str:
       sentences[0] if sentences else"",
     )
     if feature:
-      trunc = feature[:120].rsplit("", 1)[0] if len(feature) > 120 else feature
+      trunc = feature[:120].rsplit(" ", 1)[0] if len(feature) > 120 else feature
       bullets.append(trunc)
 
   color = _clean(row.get("color","")).split("|")[0].strip().title()

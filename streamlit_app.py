@@ -1,11 +1,13 @@
 """
 Decathlon Product Lookup
-Improvements over v2:
-  - Variation mapping: auto-detects size / color / color+size per model group
-  - Short description: 2-3 bullet points generated from product fields (no API needed)
-    OR via Groq when AI mode is on (better quality)
-  - Performance: keyword_match_category vectorised with numpy instead of df.apply per row
-  - Short description written to template's short_description column
+Improvements:
+  - Variation mapping: includes actual size/color values from master file
+  - Short description: rule-based bullets OR Groq AI
+  - AI category matching deduped by model_code (saves Groq API calls)
+  - Product name in export: appends color if not already present
+  - product_weight: strips " kg" from business_weight
+  - package_content: Name - Size
+  - GTIN/barcode: converted from scientific notation to full integer string
 """
 
 import os, io, re, json, asyncio
@@ -66,7 +68,6 @@ MASTER_TO_TEMPLATE = {
     "color":          "color",
     "model_label":    "model",
     "keywords":       "note",
-    "weight":         "product_weight",
     "OG_image":       "MainImage",
     "picture_1":      "Image2",
     "picture_2":      "Image3",
@@ -110,6 +111,27 @@ Respond with JSON only:
 JSON only, nothing else."""
 
 # =============================================================================
+# HELPERS
+# =============================================================================
+
+def _clean(val) -> str:
+    if pd.isna(val) or str(val).strip() in ("", "-", "nan"):
+        return ""
+    return str(val).strip()
+
+
+def _format_gtin(val) -> str:
+    """Convert scientific notation barcodes (e.g. 3.58379E+12) to full integer string."""
+    raw = str(val).strip()
+    if not raw or raw.lower() in ("nan", ""):
+        return ""
+    try:
+        return str(int(float(raw)))
+    except (ValueError, OverflowError):
+        return raw
+
+
+# =============================================================================
 # DATA LOADING
 # =============================================================================
 
@@ -122,7 +144,6 @@ def load_reference_data(file_bytes: bytes):
     df_cat["export_category"]     = df_cat["export_category"].str.strip()
     df_cat["category_name_lower"] = df_cat["category_name"].str.lower().str.strip()
     df_cat["Category Path lower"] = df_cat["Category Path"].str.lower().fillna("")
-    # Pre-tokenise paths for fast numpy matching
     df_cat["_path_tokens"] = df_cat["Category Path lower"].apply(
         lambda p: set(re.findall(r"[a-z]+", p))
     )
@@ -181,7 +202,7 @@ def tfidf_shortlist(queries: list, leaves, vectorizer, matrix, k: int = 30) -> l
 
 
 # =============================================================================
-# KEYWORD MATCHING  — vectorised, no per-row apply()
+# KEYWORD MATCHING  — vectorised
 # =============================================================================
 
 def _build_query_string(row: pd.Series) -> str:
@@ -193,27 +214,9 @@ def _build_query_string(row: pd.Series) -> str:
     return " ".join(parts)
 
 
-@st.cache_data(show_spinner=False)
-def _precompute_cat_token_arrays(df_cat_json: str):
-    """Convert pre-tokenised path sets to a list for fast overlap scoring."""
-    import json
-    records = json.loads(df_cat_json)
-    token_sets = [set(r["_path_tokens"]) for r in records]
-    depths     = [r["Category Path lower"].count("/") for r in records]
-    names      = [r["category_name_lower"] for r in records]
-    exports    = [r["export_category"] for r in records]
-    return token_sets, depths, names, exports
-
-
 def keyword_match_batch(rows_df: pd.DataFrame, df_cat: pd.DataFrame) -> list:
-    """
-    Vectorised keyword match for ALL rows at once.
-    Returns list of (primary_export, additional_export) per row.
-    """
-    # Build query strings for all rows
     queries = [_build_query_string(row) for _, row in rows_df.iterrows()]
 
-    # Pre-extract category data once
     cat_token_sets = df_cat["_path_tokens"].tolist()
     cat_depths     = df_cat["Category Path lower"].str.count("/").tolist()
     cat_names      = df_cat["category_name_lower"].tolist()
@@ -226,14 +229,12 @@ def keyword_match_batch(rows_df: pd.DataFrame, df_cat: pd.DataFrame) -> list:
             results.append(("", ""))
             continue
         q_tokens = set(re.findall(r"[a-z]+", query))
-        # Score all categories in one list comprehension
         scores = [
             len(q_tokens & cat_token_sets[j])
             + (2 if cat_names[j] in query else 0)
             + cat_depths[j] * 0.1
             for j in range(n_cats)
         ]
-        # Get top-2 indices
         top2 = sorted(range(n_cats), key=lambda j: scores[j], reverse=True)[:2]
         primary   = cat_exports[top2[0]] if scores[top2[0]] > 0 else ""
         secondary = cat_exports[top2[1]] if len(top2) > 1 and scores[top2[1]] > 0 else ""
@@ -242,7 +243,6 @@ def keyword_match_batch(rows_df: pd.DataFrame, df_cat: pd.DataFrame) -> list:
 
 
 def keyword_match_category(row: pd.Series, df_cat: pd.DataFrame) -> tuple:
-    """Single-row convenience wrapper (used for override preview)."""
     return keyword_match_batch(pd.DataFrame([row]), df_cat)[0]
 
 
@@ -250,61 +250,51 @@ def keyword_match_category(row: pd.Series, df_cat: pd.DataFrame) -> tuple:
 # VARIATION MAPPING
 # =============================================================================
 
-def compute_variation(row: pd.Series, df_master: pd.DataFrame) -> str:
-    """
-    Determine the variation string for a SKU based on its model_code group.
-    Logic:
-      - Group all SKUs by model_code
-      - If group has multiple unique colors AND multiple unique sizes → 'color,size'
-      - If group has multiple unique sizes only                        → 'size'
-      - If group has multiple unique colors only                       → 'color'
-      - Single SKU                                                     → 'size'  (Jumia default)
-    Returns the variation value string.
-    """
-    model_code = row.get("model_code", "")
-    if not model_code or pd.isna(model_code):
-        return "size"
-
-    group = df_master[df_master["model_code"] == model_code]
-    n_colors = group["color"].nunique()
-    n_sizes  = group["size"].nunique()
-
-    if n_colors > 1 and n_sizes > 1:
-        return "color,size"
-    elif n_colors > 1:
-        return "color"
-    else:
-        return "size"
-
-
 @st.cache_data(show_spinner=False)
 def build_variation_map(master_bytes: bytes, is_csv: bool) -> dict:
-    """Pre-compute variation string for every model_code → {sku: variation}."""
+    """
+    Per SKU: variation type + all sibling sizes/colors from the model group.
+    Uses actual values straight from the size and color columns.
+      size only      -> "size:XS,S,M,L,XL"
+      color only     -> "color:Red,Blue"
+      color + size   -> "color,size:Red,Blue|XS,S,M,L"
+    """
     df = load_master(master_bytes, is_csv)
     result = {}
+
     for mc, grp in df.groupby("model_code"):
-        n_colors = grp["color"].nunique()
-        n_sizes  = grp["size"].nunique()
+        sizes = [
+            str(v).strip() for v in grp["size"].dropna()
+            if str(v).strip().lower() not in ("", "-", "nan", "no size")
+        ]
+        colors = [
+            str(v).strip().split("|")[0].strip()
+            for v in grp["color"].dropna()
+            if str(v).strip().lower() not in ("", "-", "nan")
+        ]
+
+        unique_sizes  = list(dict.fromkeys(sizes))
+        unique_colors = list(dict.fromkeys(colors))
+
+        n_colors = len(set(unique_colors))
+        n_sizes  = len(set(unique_sizes))
+
         if n_colors > 1 and n_sizes > 1:
-            var = "color,size"
+            var = f"color,size:{','.join(unique_colors)}|{','.join(unique_sizes)}"
         elif n_colors > 1:
-            var = "color"
+            var = f"color:{','.join(unique_colors)}"
         else:
-            var = "size"
+            var = f"size:{','.join(unique_sizes)}" if unique_sizes else "size"
+
         for sku in grp["sku_num_sku_r3"]:
             result[sku] = var
+
     return result
 
 
 # =============================================================================
 # SHORT DESCRIPTION  (rule-based, instant)
 # =============================================================================
-
-def _clean(val) -> str:
-    if pd.isna(val) or str(val).strip() in ("", "-", "nan"):
-        return ""
-    return str(val).strip()
-
 
 GENDER_MAP = {
     "MEN'S": "Men", "WOMEN'S": "Women", "BOYS'": "Boys", "GIRLS'": "Girls",
@@ -314,13 +304,8 @@ GENDER_MAP = {
 
 
 def rule_based_short_desc(row: pd.Series) -> str:
-    """
-    Build 3 bullet points from master fields without any API call.
-    Returns newline-separated bullets.
-    """
     bullets = []
 
-    # Bullet 1: Sport · Gender — use department_label (fuller than truncated type)
     dept   = _clean(row.get("department_label", "")).replace("/", "·").title()
     sport  = dept if dept else _clean(row.get("type", "")).title()
     g_raw  = _clean(row.get("channable_gender", "")).split("|")[0].strip().upper()
@@ -329,7 +314,6 @@ def rule_based_short_desc(row: pd.Series) -> str:
         who = f" · {gender}" if gender else ""
         bullets.append(f"• {sport}{who}")
 
-    # Bullet 2: Key feature — skip "Our team/designers" boilerplate opener
     desc = _clean(row.get("designed_for", ""))
     if desc:
         sentences = [s.strip() for s in re.split(r"[.!?]", desc) if len(s.strip()) > 20]
@@ -341,7 +325,6 @@ def rule_based_short_desc(row: pd.Series) -> str:
             trunc = feature[:120].rsplit(" ", 1)[0] if len(feature) > 120 else feature
             bullets.append(f"• {trunc}")
 
-    # Bullet 3: Colour · Size  (strip escaped quotes and trailing junk)
     color = _clean(row.get("color", "")).split("|")[0].strip().title()
     size  = re.sub(r'"+', "", _clean(row.get("size", ""))).strip().rstrip(" .")
     if color and size and size.lower() != "no size":
@@ -355,7 +338,7 @@ def rule_based_short_desc(row: pd.Series) -> str:
 
 
 # =============================================================================
-# AI MATCHING  (TF-IDF → Groq, all parallel)
+# AI MATCHING  (TF-IDF -> Groq, all parallel)
 # =============================================================================
 
 async def _async_rerank(idx, query, candidates, client, model, top_n, sem, task_type="cat"):
@@ -365,7 +348,7 @@ async def _async_rerank(idx, query, candidates, client, model, top_n, sem, task_
                 cand_list = "\n".join(f"- {c}" for c in candidates)
                 sys_msg   = GROQ_SYSTEM_CAT.format(top_n=top_n)
                 user_msg  = f"Product: {query}\n\nCandidates:\n{cand_list}"
-            else:  # desc
+            else:
                 sys_msg   = GROQ_SYSTEM_DESC
                 user_msg  = f"Product details: {query}"
 
@@ -404,10 +387,6 @@ def groq_batch(items, api_key, model, concurrency, task_type="cat"):
 
 def ai_match_categories(rows_df, leaves, vectorizer, matrix, path_to_export,
                         api_key, model, shortlist_k=30, concurrency=10):
-    queries         = [_build_query_string(row) for _, row in rows_df.iterrows()]
-    candidates_list = tfidf_shortlist(queries, leaves, vectorizer, matrix, shortlist_k)
-    items           = list(zip(queries, candidates_list))
-    all_preds       = groq_batch(items, api_key, model, concurrency, task_type="cat")
 
     def _resolve(cat_path: str) -> str:
         if cat_path in path_to_export:
@@ -417,17 +396,47 @@ def ai_match_categories(rows_df, leaves, vectorizer, matrix, path_to_export,
                 return ex
         return cat_path
 
-    results = []
-    for data in all_preds:
-        cats = data.get("categories", [])
+    # Deduplicate by model_code — one Groq call per model, not per SKU
+    model_to_query: dict = {}
+    for _, row in rows_df.iterrows():
+        mc = str(row.get("model_code", "")).strip()
+        if mc and mc not in model_to_query:
+            group = rows_df[rows_df["model_code"] == mc]
+            model_to_query[mc] = _build_query_string(group.iloc[0])
+
+    unique_models  = list(model_to_query.keys())
+    unique_queries = [model_to_query[mc] for mc in unique_models]
+
+    candidates_list = tfidf_shortlist(unique_queries, leaves, vectorizer, matrix, shortlist_k)
+    items           = list(zip(unique_queries, candidates_list))
+    raw_preds       = groq_batch(items, api_key, model, concurrency, task_type="cat")
+
+    model_to_cats: dict = {}
+    for mc, data in zip(unique_models, raw_preds):
+        cats      = data.get("categories", [])
         primary   = _resolve(cats[0]["category"]) if len(cats) > 0 else ""
         secondary = _resolve(cats[1]["category"]) if len(cats) > 1 else ""
-        results.append((primary, secondary))
+        model_to_cats[mc] = (primary, secondary)
+
+    # Fan out: every SKU gets its model's categories
+    results = []
+    for _, row in rows_df.iterrows():
+        mc = str(row.get("model_code", "")).strip()
+        if mc and mc in model_to_cats:
+            results.append(model_to_cats[mc])
+        else:
+            q  = _build_query_string(row)
+            c  = tfidf_shortlist([q], leaves, vectorizer, matrix, shortlist_k)[0]
+            rd = groq_batch([(q, c)], api_key, model, 1, task_type="cat")[0]
+            cats      = rd.get("categories", [])
+            primary   = _resolve(cats[0]["category"]) if len(cats) > 0 else ""
+            secondary = _resolve(cats[1]["category"]) if len(cats) > 1 else ""
+            results.append((primary, secondary))
+
     return results
 
 
 def _build_desc_query_per_model(group_df: pd.DataFrame) -> str:
-    """One Groq query per model group — uses shared fields only, excludes color/size."""
     row   = group_df.iloc[0]
     parts = [
         _clean(row.get("product_name", "")),
@@ -441,11 +450,6 @@ def _build_desc_query_per_model(group_df: pd.DataFrame) -> str:
 
 
 def ai_short_descriptions(rows_df, api_key, model, concurrency=10):
-    """
-    Generate short descriptions via Groq, deduplicated per model_code.
-    ~5x fewer API calls since all SKUs of a model share the same description.
-    """
-    # Step 1: one query per unique model_code
     model_queries: dict = {}
     model_repr:    dict = {}
     for i, (_, row) in enumerate(rows_df.iterrows()):
@@ -457,9 +461,7 @@ def ai_short_descriptions(rows_df, api_key, model, concurrency=10):
 
     unique_models = list(model_queries.keys())
     items         = [(model_queries[mc], []) for mc in unique_models]
-
-    # Step 2: single Groq batch for all unique models
-    raw_results = groq_batch(items, api_key, model, concurrency, task_type="desc")
+    raw_results   = groq_batch(items, api_key, model, concurrency, task_type="desc")
 
     model_to_desc: dict = {}
     for mc, data in zip(unique_models, raw_results):
@@ -470,7 +472,6 @@ def ai_short_descriptions(rows_df, api_key, model, concurrency=10):
             bullets = data.get("bullets", [])
             model_to_desc[mc] = "\n".join(f"• {b}" for b in bullets[:3])
 
-    # Step 3: fan out — every SKU row gets its model's description
     descs = []
     for _, row in rows_df.iterrows():
         mc = str(row.get("model_code", "")).strip()
@@ -507,9 +508,9 @@ def match_brand(raw: str, df_brands: pd.DataFrame) -> str:
 
 def build_template(
     results_df, df_cat, df_brands,
-    ai_categories,          # list[(primary, additional)] — already merged with overrides
-    short_descs,            # list[str] — one per row
-    variation_map,          # dict[sku → variation_string]
+    ai_categories,
+    short_descs,
+    variation_map,
 ) -> bytes:
     wb = load_workbook(TEMPLATE_PATH)
     ws = wb["Upload Template"]
@@ -528,18 +529,47 @@ def build_template(
         row_idx  = i + 2
         row_data = {}
 
-        # Standard fields
+        # ── Standard fields ────────────────────────────────────────────────
         for master_col, tmpl_col in MASTER_TO_TEMPLATE.items():
             val = src_row.get(master_col, "")
             if pd.notna(val) and str(val).strip() not in ("", "nan"):
                 row_data[tmpl_col] = str(val).strip()
 
-        # Brand
+        # ── GTIN: convert scientific notation to full integer string ───────
+        gtin = _format_gtin(src_row.get("bar_code", ""))
+        if gtin:
+            row_data["GTIN_Barcode"] = gtin
+
+        # ── Product name: append color if not already present ──────────────
+        product_name = str(src_row.get("product_name", "")).strip()
+        color_raw    = str(src_row.get("color", "")).strip()
+        color        = color_raw.split("|")[0].strip()
+
+        if product_name and color:
+            if not product_name.lower().endswith(color.lower()):
+                row_data["Name"] = f"{product_name} - {color.title()}"
+            else:
+                row_data["Name"] = product_name
+        elif product_name:
+            row_data["Name"] = product_name
+
+        # ── product_weight: strip " kg" from business_weight ──────────────
+        bw = str(src_row.get("business_weight", "")).strip()
+        if bw and bw.lower() not in ("", "nan"):
+            row_data["product_weight"] = re.sub(r'\s*kg\s*$', '', bw, flags=re.IGNORECASE).strip()
+
+        # ── package_content: "Name - Size" ────────────────────────────────
+        size_val = re.sub(r'"+', '', str(src_row.get("size", ""))).strip().rstrip(" .")
+        if size_val.lower() not in ("", "nan", "no size"):
+            pkg_name = row_data.get("Name", product_name)
+            row_data["package_content"] = f"{pkg_name} - {size_val}"
+
+        # ── Brand ──────────────────────────────────────────────────────────
         raw_brand = src_row.get("brand_name", "")
         if pd.notna(raw_brand) and str(raw_brand).strip():
             row_data["Brand"] = match_brand(str(raw_brand), df_brands)
 
-        # Category (already resolved — ai_categories contains merged overrides)
+        # ── Category ───────────────────────────────────────────────────────
         if ai_categories and i < len(ai_categories):
             primary, secondary = ai_categories[i]
         else:
@@ -549,15 +579,15 @@ def build_template(
         if secondary:
             row_data["AdditionalCategory"] = secondary
 
-        # Variation
+        # ── Variation ──────────────────────────────────────────────────────
         sku = str(src_row.get("sku_num_sku_r3", "")).strip()
         row_data["variation"] = variation_map.get(sku, "size")
 
-        # Short description
+        # ── Short description ──────────────────────────────────────────────
         if short_descs and i < len(short_descs) and short_descs[i]:
             row_data["short_description"] = short_descs[i]
 
-        # Write cells
+        # ── Write cells ────────────────────────────────────────────────────
         for tmpl_col, value in row_data.items():
             if tmpl_col in header_map:
                 cell           = ws.cell(row=row_idx, column=header_map[tmpl_col])
@@ -634,7 +664,7 @@ with st.sidebar:
 
 
 # =============================================================================
-# LOAD REFERENCE DATA  (always from disk)
+# LOAD REFERENCE DATA
 # =============================================================================
 
 try:
@@ -680,9 +710,7 @@ else:
         st.error("No master file found. Upload one in the sidebar.")
         st.stop()
 
-# Pre-compute variation map for the whole master (cached)
-variation_map = build_variation_map(master_bytes, is_csv) if master_bytes else {}
-
+variation_map    = build_variation_map(master_bytes, is_csv) if master_bytes else {}
 img_cols_present = [c for c in IMAGE_COLS if c in df_master.columns]
 data_cols        = [c for c in df_master.columns if c not in img_cols_present]
 
@@ -693,9 +721,7 @@ data_cols        = [c for c in df_master.columns if c not in img_cols_present]
 
 def search(q: str) -> pd.DataFrame:
     mask = pd.Series(False, index=df_master.index)
-    # Always exact-match on SKU
     mask |= df_master["sku_num_sku_r3"].fillna("").str.strip() == q.strip()
-    # Optionally also search product name
     if also_search_name and "product_name" in df_master.columns:
         mask |= df_master["product_name"].fillna("").str.lower().str.contains(q.lower(), regex=False)
     return df_master[mask].copy()
@@ -762,19 +788,20 @@ if queries:
 
         combined = pd.concat([r for _, r in all_result_frames], ignore_index=True)
 
-        # ── 1. Category matching ───────────────────────────────────────────────
+        # ── 1. Category matching ───────────────────────────────────────────
         ai_categories = None
 
         if df_cat is not None and use_ai_matching and groq_api_key:
-            n   = len(combined)
-            est = max(2, n // concurrency + 2)
-            with st.spinner(f"🤖 AI category matching {n} products (~{est}s)…"):
+            n               = len(combined)
+            unique_models_n = combined["model_code"].nunique() if "model_code" in combined.columns else n
+            est             = max(2, unique_models_n // concurrency + 2)
+            with st.spinner(f"🤖 AI category matching {unique_models_n} unique models (~{est}s)…"):
                 try:
                     ai_categories = ai_match_categories(
                         combined, leaves, vectorizer, tfidf_matrix, path_to_export,
                         groq_api_key, groq_model, shortlist_k, concurrency,
                     )
-                    st.success(f"✅ AI matched {n} products")
+                    st.success(f"✅ AI matched {unique_models_n} models → {n} SKUs")
                 except Exception as e:
                     st.error(f"Groq category error: {e}")
                     use_ai_matching = False
@@ -782,7 +809,7 @@ if queries:
             st.warning("Enter your Groq API key in the sidebar to use AI matching.")
             use_ai_matching = False
 
-        # ── 2. Short descriptions ──────────────────────────────────────────────
+        # ── 2. Short descriptions ──────────────────────────────────────────
         short_descs = None
 
         if use_ai_matching and ai_short_desc and groq_api_key:
@@ -795,14 +822,12 @@ if queries:
                     short_descs = None
 
         if short_descs is None:
-            # Rule-based fallback (instant)
             short_descs = [rule_based_short_desc(row) for _, row in combined.iterrows()]
 
-        # ── 3. Results table — inline, always visible ────────────────────────
+        # ── 3. Results table ───────────────────────────────────────────────
         st.markdown("---")
         st.subheader(f"📋 Results — {total_rows} SKU(s)")
 
-        # Build display columns: key fields first, images last
         priority_cols = ["sku_num_sku_r3", "product_name", "color", "size",
                          "brand_name", "department_label", "bar_code"]
         show_cols = [c for c in priority_cols if c in combined.columns]
@@ -825,7 +850,7 @@ if queries:
             },
         )
 
-        # ── Images ────────────────────────────────────────────────────────────
+        # ── Images ─────────────────────────────────────────────────────────
         if show_images and img_cols_present:
             st.markdown("---")
             st.subheader("🖼 Product Images")
@@ -851,7 +876,7 @@ if queries:
                         col_ui.markdown(f"[🔗 Image]({img_urls[0]})")
                     shown += 1
 
-        # ── 4. Category editor — always visible, with search ──────────────────
+        # ── 4. Category editor ─────────────────────────────────────────────
         if df_cat is not None:
             st.markdown("---")
             mode_label = "🤖 AI" if (use_ai_matching and ai_categories) else "🔑 Keyword"
@@ -863,7 +888,6 @@ if queries:
             if "cat_overrides" not in st.session_state:
                 st.session_state.cat_overrides = {}
 
-            # Category search filter
             cat_search = st.text_input(
                 "🔍 Filter category list",
                 placeholder="e.g. football, running, kids...",
@@ -885,7 +909,6 @@ if queries:
             )
             st.markdown("---")
 
-            # Header row
             hc1, hc2, hc3, hc4, hc5, hc6 = st.columns([2, 3, 3, 1, 1, 2])
             hc1.markdown("**SKU · Product**")
             hc2.markdown("**Primary Category**")
@@ -909,9 +932,7 @@ if queries:
                 c1, c2, c3, c4, c5, c6 = st.columns([2, 3, 3, 1, 1, 2])
                 c1.markdown(f"**{sku}**  \n{name}")
 
-                # Primary category — use filtered list
-                cur_prim = override.get("primary", auto_prim)
-                # If current value not in filtered list, add it so it doesn't reset
+                cur_prim  = override.get("primary", auto_prim)
                 prim_opts = filtered_cats if cur_prim in filtered_cats else ["(auto)", cur_prim] + [c for c in filtered_cats if c != "(auto)"]
                 try:
                     prim_idx = prim_opts.index(cur_prim)
@@ -922,8 +943,7 @@ if queries:
                     index=prim_idx, label_visibility="collapsed", key=f"prim_{i}",
                 )
 
-                # Additional category — use filtered list
-                cur_addl = override.get("additional", auto_addl)
+                cur_addl  = override.get("additional", auto_addl)
                 addl_opts = filtered_cats if cur_addl in filtered_cats else ["(auto)", cur_addl] + [c for c in filtered_cats if c != "(auto)"]
                 try:
                     addl_idx = addl_opts.index(cur_addl)
@@ -936,7 +956,6 @@ if queries:
 
                 c4.markdown(f"`{var_val}`")
 
-                # Save overrides
                 if new_prim != "(auto)" or new_addl != "(auto)":
                     st.session_state.cat_overrides[i] = {
                         "primary":    auto_prim if new_prim == "(auto)" else new_prim,
@@ -951,7 +970,7 @@ if queries:
                 c5.markdown(f"`{badge}`")
                 c6.markdown(sd_val.replace("\n", "  \n") if sd_val else "_—_")
 
-        # ── Download buttons ───────────────────────────────────────────────────
+        # ── Download buttons ───────────────────────────────────────────────
         st.markdown("---")
         col_dl1, col_dl2 = st.columns(2)
 

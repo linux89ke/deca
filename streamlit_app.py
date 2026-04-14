@@ -14,8 +14,6 @@ import os, io, re, json, asyncio
 import numpy as np
 import streamlit as st
 import pandas as pd
-import requests
-from PIL import Image
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -67,7 +65,6 @@ MASTER_TO_TEMPLATE = {
     "bar_code":       "GTIN_Barcode",
     "color":          "color",
     "model_label":    "model",
-    "keywords":       "note",
     "OG_image":       "MainImage",
     "picture_1":      "Image2",
     "picture_2":      "Image3",
@@ -247,49 +244,15 @@ def keyword_match_category(row: pd.Series, df_cat: pd.DataFrame) -> tuple:
 
 
 # =============================================================================
-# VARIATION MAPPING
+# VARIATION  (direct from each row's size column)
 # =============================================================================
 
-@st.cache_data(show_spinner=False)
-def build_variation_map(master_bytes: bytes, is_csv: bool) -> dict:
-    """
-    Per SKU: variation type + all sibling sizes/colors from the model group.
-    Uses actual values straight from the size and color columns.
-      size only      -> "size:XS,S,M,L,XL"
-      color only     -> "color:Red,Blue"
-      color + size   -> "color,size:Red,Blue|XS,S,M,L"
-    """
-    df = load_master(master_bytes, is_csv)
-    result = {}
-
-    for mc, grp in df.groupby("model_code"):
-        sizes = [
-            str(v).strip() for v in grp["size"].dropna()
-            if str(v).strip().lower() not in ("", "-", "nan", "no size")
-        ]
-        colors = [
-            str(v).strip().split("|")[0].strip()
-            for v in grp["color"].dropna()
-            if str(v).strip().lower() not in ("", "-", "nan")
-        ]
-
-        unique_sizes  = list(dict.fromkeys(sizes))
-        unique_colors = list(dict.fromkeys(colors))
-
-        n_colors = len(set(unique_colors))
-        n_sizes  = len(set(unique_sizes))
-
-        if n_colors > 1 and n_sizes > 1:
-            var = f"color,size:{','.join(unique_colors)}|{','.join(unique_sizes)}"
-        elif n_colors > 1:
-            var = f"color:{','.join(unique_colors)}"
-        else:
-            var = f"size:{','.join(unique_sizes)}" if unique_sizes else "size"
-
-        for sku in grp["sku_num_sku_r3"]:
-            result[sku] = var
-
-    return result
+def get_variation(row: pd.Series) -> str:
+    """Return the size value for this SKU directly from its row."""
+    raw = re.sub(r'"+', '', str(row.get("size", ""))).strip().rstrip(" .")
+    if raw.lower() in ("", "nan", "no size"):
+        return "size"
+    return raw
 
 
 # =============================================================================
@@ -312,7 +275,7 @@ def rule_based_short_desc(row: pd.Series) -> str:
     gender = GENDER_MAP.get(g_raw, g_raw.title())
     if sport:
         who = f" · {gender}" if gender else ""
-        bullets.append(f"• {sport}{who}")
+        bullets.append(f"{sport}{who}")
 
     desc = _clean(row.get("designed_for", ""))
     if desc:
@@ -323,18 +286,21 @@ def rule_based_short_desc(row: pd.Series) -> str:
         )
         if feature:
             trunc = feature[:120].rsplit(" ", 1)[0] if len(feature) > 120 else feature
-            bullets.append(f"• {trunc}")
+            bullets.append(trunc)
 
     color = _clean(row.get("color", "")).split("|")[0].strip().title()
     size  = re.sub(r'"+', "", _clean(row.get("size", ""))).strip().rstrip(" .")
     if color and size and size.lower() != "no size":
-        bullets.append(f"• {color} · Size {size}")
+        bullets.append(f"{color} · Size {size}")
     elif color:
-        bullets.append(f"• Colour: {color}")
+        bullets.append(f"Colour: {color}")
     elif size and size.lower() != "no size":
-        bullets.append(f"• Size: {size}")
+        bullets.append(f"Size: {size}")
 
-    return "\n".join(bullets[:3]) if bullets else ""
+    if not bullets:
+        return ""
+    items = "".join(f"<li>{b}</li>" for b in bullets[:3])
+    return f"<ul>{items}</ul>"
 
 
 # =============================================================================
@@ -396,35 +362,37 @@ def ai_match_categories(rows_df, leaves, vectorizer, matrix, path_to_export,
                 return ex
         return cat_path
 
-    # Deduplicate by model_code — one Groq call per model, not per SKU
+    # ── One query per unique model_code ──────────────────────────────────────
     model_to_query: dict = {}
+    model_order: list   = []
     for _, row in rows_df.iterrows():
         mc = str(row.get("model_code", "")).strip()
         if mc and mc not in model_to_query:
             group = rows_df[rows_df["model_code"] == mc]
             model_to_query[mc] = _build_query_string(group.iloc[0])
+            model_order.append(mc)
 
-    unique_models  = list(model_to_query.keys())
-    unique_queries = [model_to_query[mc] for mc in unique_models]
-
+    unique_queries  = [model_to_query[mc] for mc in model_order]
     candidates_list = tfidf_shortlist(unique_queries, leaves, vectorizer, matrix, shortlist_k)
     items           = list(zip(unique_queries, candidates_list))
     raw_preds       = groq_batch(items, api_key, model, concurrency, task_type="cat")
 
+    # ── Store result per model_code ───────────────────────────────────────────
     model_to_cats: dict = {}
-    for mc, data in zip(unique_models, raw_preds):
+    for mc, data in zip(model_order, raw_preds):
         cats      = data.get("categories", [])
         primary   = _resolve(cats[0]["category"]) if len(cats) > 0 else ""
         secondary = _resolve(cats[1]["category"]) if len(cats) > 1 else ""
         model_to_cats[mc] = (primary, secondary)
 
-    # Fan out: every SKU gets its model's categories
+    # ── Fan out: every SKU in the same model gets identical categories ────────
     results = []
     for _, row in rows_df.iterrows():
         mc = str(row.get("model_code", "")).strip()
         if mc and mc in model_to_cats:
             results.append(model_to_cats[mc])
         else:
+            # fallback for rows with no model_code
             q  = _build_query_string(row)
             c  = tfidf_shortlist([q], leaves, vectorizer, matrix, shortlist_k)[0]
             rd = groq_batch([(q, c)], api_key, model, 1, task_type="cat")[0]
@@ -433,7 +401,7 @@ def ai_match_categories(rows_df, leaves, vectorizer, matrix, path_to_export,
             secondary = _resolve(cats[1]["category"]) if len(cats) > 1 else ""
             results.append((primary, secondary))
 
-    return results
+    return results, model_to_cats
 
 
 def _build_desc_query_per_model(group_df: pd.DataFrame) -> str:
@@ -470,7 +438,8 @@ def ai_short_descriptions(rows_df, api_key, model, concurrency=10):
             model_to_desc[mc] = rule_based_short_desc(fallback_row)
         else:
             bullets = data.get("bullets", [])
-            model_to_desc[mc] = "\n".join(f"• {b}" for b in bullets[:3])
+            items = "".join(f"<li>{b}</li>" for b in bullets[:3])
+            model_to_desc[mc] = f"<ul>{items}</ul>"
 
     descs = []
     for _, row in rows_df.iterrows():
@@ -510,7 +479,6 @@ def build_template(
     results_df, df_cat, df_brands,
     ai_categories,
     short_descs,
-    variation_map,
 ) -> bytes:
     wb = load_workbook(TEMPLATE_PATH)
     ws = wb["Upload Template"]
@@ -579,9 +547,8 @@ def build_template(
         if secondary:
             row_data["AdditionalCategory"] = secondary
 
-        # ── Variation ──────────────────────────────────────────────────────
-        sku = str(src_row.get("sku_num_sku_r3", "")).strip()
-        row_data["variation"] = variation_map.get(sku, "size")
+        # ── Variation: directly from this row's size ───────────────────────
+        row_data["variation"] = get_variation(src_row)
 
         # ── Short description ──────────────────────────────────────────────
         if short_descs and i < len(short_descs) and short_descs[i]:
@@ -658,9 +625,6 @@ with st.sidebar:
     st.markdown("---")
     st.header("🔎 Search Fields")
     also_search_name = st.checkbox("Also search by product name", value=False)
-    st.markdown("---")
-    show_images = st.checkbox("Show product images", value=True)
-    max_images  = st.slider("Max images per product", 1, 11, 5)
 
 
 # =============================================================================
@@ -710,7 +674,6 @@ else:
         st.error("No master file found. Upload one in the sidebar.")
         st.stop()
 
-variation_map    = build_variation_map(master_bytes, is_csv) if master_bytes else {}
 img_cols_present = [c for c in IMAGE_COLS if c in df_master.columns]
 data_cols        = [c for c in df_master.columns if c not in img_cols_present]
 
@@ -797,7 +760,7 @@ if queries:
             est             = max(2, unique_models_n // concurrency + 2)
             with st.spinner(f"🤖 AI category matching {unique_models_n} unique models (~{est}s)…"):
                 try:
-                    ai_categories = ai_match_categories(
+                    ai_categories, _model_cats = ai_match_categories(
                         combined, leaves, vectorizer, tfidf_matrix, path_to_export,
                         groq_api_key, groq_model, shortlist_k, concurrency,
                     )
@@ -824,153 +787,162 @@ if queries:
         if short_descs is None:
             short_descs = [rule_based_short_desc(row) for _, row in combined.iterrows()]
 
-        # ── 3. Results table ───────────────────────────────────────────────
+        # ── 3. Results full data view ──────────────────────────────────────
         st.markdown("---")
         st.subheader(f"📋 Results — {total_rows} SKU(s)")
 
+        # Compute derived columns for preview
+        preview = combined.copy()
+        preview["_variation"]        = preview.apply(get_variation, axis=1)
+        preview["_short_description"] = short_descs if short_descs else [
+            rule_based_short_desc(r) for _, r in preview.iterrows()
+        ]
+        # Category preview (before overrides)
+        if ai_categories:
+            preview["_primary_cat"]   = [c[0] for c in ai_categories]
+            preview["_secondary_cat"] = [c[1] for c in ai_categories]
+        elif df_cat is not None:
+            kw = keyword_match_batch(preview, df_cat)
+            preview["_primary_cat"]   = [c[0] for c in kw]
+            preview["_secondary_cat"] = [c[1] for c in kw]
+        else:
+            preview["_primary_cat"]   = ""
+            preview["_secondary_cat"] = ""
+
         priority_cols = ["sku_num_sku_r3", "product_name", "color", "size",
-                         "brand_name", "department_label", "bar_code"]
-        show_cols = [c for c in priority_cols if c in combined.columns]
-        show_cols += [c for c in data_cols if c not in show_cols and c != "Search Term"]
+                         "brand_name", "department_label", "bar_code",
+                         "_variation", "_primary_cat", "_secondary_cat", "_short_description"]
+        extra_cols = [c for c in data_cols if c not in priority_cols and c != "Search Term"]
+        show_cols  = [c for c in priority_cols if c in preview.columns] + [
+            c for c in extra_cols if c in preview.columns
+        ]
 
         st.dataframe(
-            combined[show_cols],
+            preview[show_cols],
             use_container_width=True,
             hide_index=True,
+            height=420,
             column_config={
-                "sku_num_sku_r3":    st.column_config.TextColumn("SKU",          width="small"),
-                "product_name":      st.column_config.TextColumn("Product",      width="large"),
-                "color":             st.column_config.TextColumn("Colour",       width="medium"),
-                "size":              st.column_config.TextColumn("Size",         width="medium"),
-                "brand_name":        st.column_config.TextColumn("Brand",        width="small"),
-                "department_label":  st.column_config.TextColumn("Department",   width="medium"),
-                "bar_code":          st.column_config.TextColumn("Barcode",      width="medium"),
-                "designed_for":      st.column_config.TextColumn("Description",  width="large"),
-                "keywords":          st.column_config.TextColumn("Keywords",     width="large"),
+                "sku_num_sku_r3":       st.column_config.TextColumn("SKU",            width="small"),
+                "product_name":         st.column_config.TextColumn("Product",         width="large"),
+                "color":                st.column_config.TextColumn("Colour",          width="medium"),
+                "size":                 st.column_config.TextColumn("Size",            width="medium"),
+                "brand_name":           st.column_config.TextColumn("Brand",           width="small"),
+                "department_label":     st.column_config.TextColumn("Department",      width="medium"),
+                "bar_code":             st.column_config.TextColumn("Barcode",         width="medium"),
+                "_variation":           st.column_config.TextColumn("Variation",       width="medium"),
+                "_primary_cat":         st.column_config.TextColumn("Primary Cat",     width="large"),
+                "_secondary_cat":       st.column_config.TextColumn("Additional Cat",  width="large"),
+                "_short_description":   st.column_config.TextColumn("Short Desc",      width="large"),
+                "designed_for":         st.column_config.TextColumn("Description",     width="large"),
+                "keywords":             st.column_config.TextColumn("Keywords",        width="large"),
             },
         )
-
-        # ── Images ─────────────────────────────────────────────────────────
-        if show_images and img_cols_present:
-            st.markdown("---")
-            st.subheader("🖼 Product Images")
-            img_cols_ui = st.columns(min(total_rows, 4))
-            shown = 0
-            for _, prow in combined.iterrows():
-                if shown >= total_rows:
-                    break
-                img_urls = [
-                    str(prow[c]) for c in img_cols_present
-                    if pd.notna(prow.get(c)) and str(prow.get(c, "")).startswith("http")
-                ][:max_images]
-                if img_urls:
-                    col_ui = img_cols_ui[shown % len(img_cols_ui)]
-                    sku    = str(prow.get("sku_num_sku_r3", "")).strip()
-                    name   = str(prow.get("product_name", ""))[:40]
-                    col_ui.markdown(f"**{sku}** {name}")
-                    try:
-                        resp = requests.get(img_urls[0], timeout=6)
-                        img  = Image.open(io.BytesIO(resp.content))
-                        col_ui.image(img, use_container_width=True)
-                    except Exception:
-                        col_ui.markdown(f"[🔗 Image]({img_urls[0]})")
-                    shown += 1
 
         # ── 4. Category editor ─────────────────────────────────────────────
         if df_cat is not None:
             st.markdown("---")
             mode_label = "🤖 AI" if (use_ai_matching and ai_categories) else "🔑 Keyword"
-            st.subheader(f"🗂 Categories — {mode_label}")
+            st.subheader(f"🗂 Category Editor — {mode_label}")
+            st.caption(
+                "Categories are shared across all SKUs with the same model code. "
+                "Edit one SKU per model — siblings update automatically on export."
+            )
 
             all_export_cats            = sorted(df_cat["export_category"].dropna().unique().tolist())
             all_export_cats_with_blank = ["(auto)"] + all_export_cats
 
             if "cat_overrides" not in st.session_state:
-                st.session_state.cat_overrides = {}
+                st.session_state.cat_overrides = {}   # keyed by model_code
 
+            # Search filter
             cat_search = st.text_input(
                 "🔍 Filter category list",
                 placeholder="e.g. football, running, kids...",
-                help="Type to narrow down the category dropdowns below",
                 key="cat_search",
             )
-            if cat_search.strip():
-                filtered_cats = ["(auto)"] + [
-                    c for c in all_export_cats
-                    if cat_search.strip().lower() in c.lower()
-                ]
-            else:
-                filtered_cats = all_export_cats_with_blank
-
+            filtered_cats = (
+                ["(auto)"] + [c for c in all_export_cats if cat_search.strip().lower() in c.lower()]
+                if cat_search.strip()
+                else all_export_cats_with_blank
+            )
             st.caption(
                 f"{len(filtered_cats)-1} categories shown"
                 + (f" matching '{cat_search}'" if cat_search.strip() else " (all)")
-                + f" · {len(st.session_state.cat_overrides)} manual override(s)"
+                + f" · {len(st.session_state.cat_overrides)} model override(s)"
             )
             st.markdown("---")
 
-            hc1, hc2, hc3, hc4, hc5, hc6 = st.columns([2, 3, 3, 1, 1, 2])
-            hc1.markdown("**SKU · Product**")
+            # Show one editor row per unique model_code (not per SKU)
+            seen_models: set = set()
+            hc1, hc2, hc3, hc4 = st.columns([2, 3, 3, 1])
+            hc1.markdown("**Model · SKUs**")
             hc2.markdown("**Primary Category**")
             hc3.markdown("**Additional Category**")
-            hc4.markdown("**Variation**")
-            hc5.markdown("**Method**")
-            hc6.markdown("**Short Description**")
+            hc4.markdown("**Method**")
 
             for i, (_, prow) in enumerate(combined.iterrows()):
-                if use_ai_matching and ai_categories:
-                    auto_prim, auto_addl = ai_categories[i]
+                mc = str(prow.get("model_code", "")).strip()
+                if mc in seen_models:
+                    continue
+                seen_models.add(mc)
+
+                sku_count = len(combined[combined["model_code"] == mc])
+                name      = str(prow.get("product_name", ""))[:40]
+
+                if ai_categories:
+                    # Find the index of the first row for this model
+                    first_idx = next(
+                        j for j, (_, r) in enumerate(combined.iterrows())
+                        if str(r.get("model_code", "")).strip() == mc
+                    )
+                    auto_prim, auto_addl = ai_categories[first_idx]
                 else:
                     auto_prim, auto_addl = keyword_match_category(prow, df_cat)
 
-                override = st.session_state.cat_overrides.get(i, {})
-                sku      = str(prow.get("sku_num_sku_r3", "")).strip()
-                name     = str(prow.get("product_name", ""))[:45]
-                var_val  = variation_map.get(sku, "size")
-                sd_val   = short_descs[i] if short_descs else ""
+                override  = st.session_state.cat_overrides.get(mc, {})
 
-                c1, c2, c3, c4, c5, c6 = st.columns([2, 3, 3, 1, 1, 2])
-                c1.markdown(f"**{sku}**  \n{name}")
+                c1, c2, c3, c4 = st.columns([2, 3, 3, 1])
+                c1.markdown(f"**{mc}**  \n{name}  \n`{sku_count} SKU(s)`")
 
                 cur_prim  = override.get("primary", auto_prim)
-                prim_opts = filtered_cats if cur_prim in filtered_cats else ["(auto)", cur_prim] + [c for c in filtered_cats if c != "(auto)"]
-                try:
-                    prim_idx = prim_opts.index(cur_prim)
-                except ValueError:
-                    prim_idx = 0
+                prim_opts = (
+                    filtered_cats if cur_prim in filtered_cats
+                    else ["(auto)", cur_prim] + [c for c in filtered_cats if c != "(auto)"]
+                )
+                try:    prim_idx = prim_opts.index(cur_prim)
+                except ValueError: prim_idx = 0
                 new_prim = c2.selectbox(
-                    f"Primary #{i}", prim_opts,
-                    index=prim_idx, label_visibility="collapsed", key=f"prim_{i}",
+                    f"Primary #{mc}", prim_opts,
+                    index=prim_idx, label_visibility="collapsed", key=f"prim_{mc}",
                 )
 
                 cur_addl  = override.get("additional", auto_addl)
-                addl_opts = filtered_cats if cur_addl in filtered_cats else ["(auto)", cur_addl] + [c for c in filtered_cats if c != "(auto)"]
-                try:
-                    addl_idx = addl_opts.index(cur_addl)
-                except ValueError:
-                    addl_idx = 0
+                addl_opts = (
+                    filtered_cats if cur_addl in filtered_cats
+                    else ["(auto)", cur_addl] + [c for c in filtered_cats if c != "(auto)"]
+                )
+                try:    addl_idx = addl_opts.index(cur_addl)
+                except ValueError: addl_idx = 0
                 new_addl = c3.selectbox(
-                    f"Additional #{i}", addl_opts,
-                    index=addl_idx, label_visibility="collapsed", key=f"addl_{i}",
+                    f"Additional #{mc}", addl_opts,
+                    index=addl_idx, label_visibility="collapsed", key=f"addl_{mc}",
                 )
 
-                c4.markdown(f"`{var_val}`")
-
                 if new_prim != "(auto)" or new_addl != "(auto)":
-                    st.session_state.cat_overrides[i] = {
+                    st.session_state.cat_overrides[mc] = {
                         "primary":    auto_prim if new_prim == "(auto)" else new_prim,
                         "additional": auto_addl if new_addl == "(auto)" else new_addl,
                     }
-                elif i in st.session_state.cat_overrides:
-                    del st.session_state.cat_overrides[i]
+                elif mc in st.session_state.cat_overrides:
+                    del st.session_state.cat_overrides[mc]
 
-                badge = "🖊️ Manual" if i in st.session_state.cat_overrides else (
+                badge = "🖊️ Manual" if mc in st.session_state.cat_overrides else (
                     "🤖 AI" if (use_ai_matching and ai_categories) else "🔑 Keyword"
                 )
-                c5.markdown(f"`{badge}`")
-                c6.markdown(sd_val.replace("\n", "  \n") if sd_val else "_—_")
+                c4.markdown(f"`{badge}`")
 
-        # ── Download buttons ───────────────────────────────────────────────
+        # ── 5. Download buttons ────────────────────────────────────────────
         st.markdown("---")
         col_dl1, col_dl2 = st.columns(2)
 
@@ -991,13 +963,19 @@ if queries:
                 st.warning("deca_cat.xlsx not loaded — template download unavailable.")
             else:
                 try:
+                    # Build per-row categories: override (by model) > AI > keyword
                     merged_cats = []
-                    for i, (_, prow) in enumerate(combined.iterrows()):
-                        override = st.session_state.get("cat_overrides", {}).get(i)
+                    for _, prow in combined.iterrows():
+                        mc       = str(prow.get("model_code", "")).strip()
+                        override = st.session_state.get("cat_overrides", {}).get(mc)
                         if override:
                             merged_cats.append((override["primary"], override["additional"]))
-                        elif use_ai_matching and ai_categories:
-                            merged_cats.append(ai_categories[i])
+                        elif ai_categories:
+                            first_idx = next(
+                                j for j, (_, r) in enumerate(combined.iterrows())
+                                if str(r.get("model_code", "")).strip() == mc
+                            )
+                            merged_cats.append(ai_categories[first_idx])
                         else:
                             merged_cats.append(keyword_match_category(prow, df_cat))
 
@@ -1005,7 +983,6 @@ if queries:
                         combined, df_cat, df_brands,
                         ai_categories=merged_cats,
                         short_descs=short_descs,
-                        variation_map=variation_map,
                     )
                     mode_icon = "🤖" if (use_ai_matching and ai_categories) else "🔑"
                     st.download_button(

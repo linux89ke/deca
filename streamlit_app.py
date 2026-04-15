@@ -15,9 +15,10 @@ Fixes & improvements in this version:
          category batch pre-resolved once; is_size_missing uses a cached frozenset
  - BULLETPROOF HEADERS: Export mapping completely ignores spaces, underscores, and capitalization.
  - MASTER MAPPING: Description pulls directly from the 'description' column.
- - SIZE/VARIATION STRICT: Fills either Size OR Variation exclusively based on mode. Color Family left empty.
+ - SIZE/VARIATION STRICT: Physically deletes the unused column from the template file so they never co-exist.
  - CATEGORY FORMAT: Category now exports as "CODE - FULL PATH".
- - AUTO-CREATE COLUMNS: If any required column (like Size or Variation) is completely missing from the template, the script physically creates it.
+ - AUTO-CREATE COLUMNS: If any required column is completely missing from the template, the script physically creates it.
+ - DUPLICATE COLUMNS FIXED: Removed redundant price/stock assignments.
 """
 
 import os, io, re, json, asyncio
@@ -775,6 +776,32 @@ def build_template(
             norm_val = re.sub(r'[^a-z0-9]', '', str(val).lower())
             header_map[norm_val] = col_idx
 
+    # ── STRICT SEPARATION: DELETE THE UNUSED COLUMN ──
+    # If the template file comes with BOTH columns pre-built, we physically delete the one we don't need.
+    unused_col_key = "variation" if is_fashion else "size"
+    if unused_col_key in header_map:
+        ws.delete_cols(header_map[unused_col_key])
+        
+        # Re-build header map because deleting a column shifts all columns to the left!
+        header_map = {}
+        for col_idx in range(1, ws.max_column + 1):
+            val = ws.cell(row=1, column=col_idx).value
+            if val:
+                norm_val = re.sub(r'[^a-z0-9]', '', str(val).lower())
+                header_map[norm_val] = col_idx
+
+    # ── FORCE MISSING COLUMNS GUARANTEE ──
+    # If the template lacks the active column entirely, we explicitly create it at the end.
+    active_col_key = "size" if is_fashion else "variation"
+    active_col_label = "Size" if is_fashion else "Variation"
+    
+    if active_col_key not in header_map:
+        new_col = ws.max_column + 1
+        ws.cell(row=1, column=new_col).value = active_col_label
+        header_map[active_col_key] = new_col
+        
+    current_max_col = ws.max_column
+
     hfont      = ws.cell(row=1, column=1).font
     data_font  = Font(name=hfont.name or "Calibri", size=hfont.size or 11)
     data_align = Alignment(vertical="center")
@@ -806,9 +833,6 @@ def build_template(
 
     # Brand match cache to avoid repeated lookups for the same brand string
     _brand_cache: dict = {}
-
-    # We track max columns dynamically in case we need to append missing columns
-    current_max_col = ws.max_column
 
     for i, (idx, src_row) in enumerate(results_df.iterrows()):
         row_idx  = i + 2
@@ -907,10 +931,8 @@ def build_template(
             row_data["Variation"] = computed_var   
 
         # Price_KES / Stock
-        row_data["price"]     = "100000"
         row_data["Price_KES"] = "100000"
         row_data["Stock"]     = "0"
-        row_data["stock"]     = "0"
 
         # Short description
         if short_descs and i < len(short_descs) and short_descs[i]:

@@ -1415,14 +1415,17 @@ if queries:
             "_size_ok":        st.column_config.CheckboxColumn("Size OK",        width="small"),
         }
 
-        # Highlight red rows
-        def _style_row(row):
-            if is_fashion and not row["_size_ok"]:
-                return ["background-color: #ffcccc"] * len(row)
-            return [""] * len(row)
+        # NOTE: Streamlit ignores column_config when a Styler object is passed,
+        # which was hiding the size/variation columns. Use a plain DataFrame and
+        # replace the red-row highlight with a ⚠️ status column instead.
+        df_display = preview[show_cols].copy()
+        if is_fashion and "_size_ok" in df_display.columns:
+            df_display.insert(0, "⚠️", df_display["_size_ok"].apply(
+                lambda ok: "" if ok else "⚠️ fix size"
+            ))
+            col_cfg["⚠️"] = st.column_config.TextColumn("", width="small")
 
-        styled = preview[show_cols].style.apply(_style_row, axis=1)
-        st.dataframe(styled, use_container_width=True, hide_index=True, height=420,
+        st.dataframe(df_display, use_container_width=True, hide_index=True, height=420,
                      column_config=col_cfg)
 
         # ── 6. Per-row size fix (fashion only) ────────────────────────────────

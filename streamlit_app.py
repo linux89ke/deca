@@ -13,6 +13,7 @@ Fixes & improvements in this version:
  - IMAGE FIX: images are now packed sequentially (no blank gaps) — skips empty picture_1/2/etc.
  - PERF: keyword scoring vectorised with numpy; brand match cached per unique brand string;
          category batch pre-resolved once; is_size_missing uses a cached frozenset
+ - BULLETPROOF HEADERS: Export mapping completely ignores spaces, underscores, and capitalization.
 """
 
 import os, io, re, json, asyncio
@@ -762,11 +763,15 @@ def build_template(
 
     ws = wb["Upload Template"]
 
+    # ── BULLETPROOF HEADER MAPPING ──
+    # Normalizes all headers by removing any spaces, underscores, and converting to lowercase.
+    # e.g., "Short Description", "short_description", and "ShortDescription" all become "shortdescription"
     header_map = {}
     for col_idx in range(1, ws.max_column + 1):
         val = ws.cell(row=1, column=col_idx).value
         if val:
-            header_map[val] = col_idx
+            norm_val = re.sub(r'[^a-z0-9]', '', str(val).lower())
+            header_map[norm_val] = col_idx
 
     hfont      = ws.cell(row=1, column=1).font
     data_font  = Font(name=hfont.name or "Calibri", size=hfont.size or 11)
@@ -887,15 +892,11 @@ def build_template(
             valid_sizes=valid_sizes,
             size_override=per_row_override,
         )
-        
-        # Dynamically find the exact column header in your Excel template (case-insensitive)
-        size_header = next((h for h in header_map if str(h).lower() == "size"), "size")
-        var_header  = next((h for h in header_map if str(h).lower() == "variation"), "variation")
 
         if is_fashion:
-            row_data[size_header] = computed_var
+            row_data["size"] = computed_var
         else:
-            row_data[var_header]  = computed_var
+            row_data["variation"] = computed_var
 
         # Price_KES: always 100,000
         row_data["price"]     = "100000"
@@ -917,10 +918,12 @@ def build_template(
         # Determine if this row should be red (size missing from sizes.txt)
         flag_red = is_fashion and is_size_missing(computed_var, valid_sizes or [])
 
-        # Write cells
+        # Write cells using the bulletproof normalized headers
         for tmpl_col, value in row_data.items():
-            if tmpl_col in header_map:
-                cell           = ws.cell(row=row_idx, column=header_map[tmpl_col])
+            norm_tmpl_col = re.sub(r'[^a-z0-9]', '', str(tmpl_col).lower())
+            
+            if norm_tmpl_col in header_map:
+                cell           = ws.cell(row=row_idx, column=header_map[norm_tmpl_col])
                 cell.value     = value
                 cell.font      = data_font
                 cell.alignment = data_align

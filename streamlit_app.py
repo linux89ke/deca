@@ -16,6 +16,8 @@ Fixes & improvements in this version:
  - BULLETPROOF HEADERS: Export mapping completely ignores spaces, underscores, and capitalization.
  - MASTER MAPPING: Description pulls directly from the 'description' column.
  - SIZE/VARIATION STRICT: Fills either Size OR Variation exclusively based on mode. Color Family left empty.
+ - FORCE COLUMNS: If Size/Variation headers are missing in the template, they are appended automatically.
+ - CATEGORY FORMAT: Category now exports as "CODE - FULL PATH".
 """
 
 import os, io, re, json, asyncio
@@ -766,14 +768,24 @@ def build_template(
     ws = wb["Upload Template"]
 
     # ── BULLETPROOF HEADER MAPPING ──
-    # Normalizes all headers by removing any spaces, underscores, and converting to lowercase.
-    # e.g., "Short Description", "short_description", and "ShortDescription" all become "shortdescription"
     header_map = {}
     for col_idx in range(1, ws.max_column + 1):
         val = ws.cell(row=1, column=col_idx).value
         if val:
             norm_val = re.sub(r'[^a-z0-9]', '', str(val).lower())
             header_map[norm_val] = col_idx
+
+    # ── FORCE MISSING COLUMNS GUARANTEE ──
+    # If the template lacks the columns entirely, we explicitly create them at the end.
+    if "size" not in header_map:
+        new_col = ws.max_column + 1
+        ws.cell(row=1, column=new_col).value = "Size"
+        header_map["size"] = new_col
+        
+    if "variation" not in header_map:
+        new_col = ws.max_column + 1
+        ws.cell(row=1, column=new_col).value = "Variation"
+        header_map["variation"] = new_col
 
     hfont      = ws.cell(row=1, column=1).font
     data_font  = Font(name=hfont.name or "Calibri", size=hfont.size or 11)
@@ -817,8 +829,7 @@ def build_template(
             if pd.notna(val) and str(val).strip() not in ("", "nan"):
                 row_data[tmpl_col] = str(val).strip()
 
-        # Images: collect all non-empty URLs from IMAGE_COLS in order,
-        # then pack them into template slots sequentially (no gaps).
+        # Images: collect all non-empty URLs from IMAGE_COLS in order
         img_urls = [
             str(src_row[c]).strip()
             for c in IMAGE_COLS
@@ -837,7 +848,7 @@ def build_template(
         if gtin:
             row_data["GTIN_Barcode"] = gtin
 
-        # Product name: append colour only if colour not already anywhere in name
+        # Product name: append colour
         product_name = str(src_row.get("product_name", "")).strip()
         color_raw    = str(src_row.get("color", "")).strip()
         color        = color_raw.split("|")[0].strip()
@@ -869,7 +880,7 @@ def build_template(
                 _brand_cache[brand_key] = match_brand(brand_key, df_brands)
             row_data["Brand"] = _brand_cache[brand_key]
 
-        # Category — full Category Path
+        # Category — formatted as CODE - FULL PATH
         if ai_categories and i < len(ai_categories):
             primary_code, secondary_code = ai_categories[i]
         elif _kw_cats:
@@ -880,13 +891,17 @@ def build_template(
         primary_full   = exp_to_fullpath.get(primary_code, primary_code)
         secondary_full = exp_to_fullpath.get(secondary_code, secondary_code)
 
-        if primary_full:
-            row_data["PrimaryCategory"]   = primary_full
-        if secondary_full:
+        if primary_code and primary_full:
+            row_data["PrimaryCategory"] = f"{primary_code} - {primary_full}" if primary_code != primary_full else primary_full
+        elif primary_full:
+            row_data["PrimaryCategory"] = primary_full
+            
+        if secondary_code and secondary_full:
+            row_data["AdditionalCategory"] = f"{secondary_code} - {secondary_full}" if secondary_code != secondary_full else secondary_full
+        elif secondary_full:
             row_data["AdditionalCategory"] = secondary_full
 
-        # Size/Variation: per-row override takes priority, then auto
-        # Fashion writes to 'size' column; Other writes to 'variation' column
+        # Size/Variation
         per_row_override = (size_overrides or {}).get(idx)
         computed_var = get_variation(
             src_row,
@@ -894,34 +909,26 @@ def build_template(
             valid_sizes=valid_sizes,
             size_override=per_row_override,
         )
-        
-        # Dynamically find the exact column header in your Excel template (case-insensitive)
-        size_header = next((h for h in header_map if str(h).lower() == "size"), "size")
-        var_header  = next((h for h in header_map if str(h).lower() == "variation"), "variation")
 
+        # Write directly to normalized keys — our fallback logic guarantees these exist now
         if is_fashion:
-            row_data[size_header] = computed_var   # Fills ONLY Size in Fashion mode
+            row_data["size"] = computed_var   
         else:
-            row_data[var_header]  = computed_var   # Fills ONLY Variation in Other mode
+            row_data["variation"]  = computed_var   
 
-        # Price_KES: always 100,000
+        # Price_KES / Stock
         row_data["price"]     = "100000"
         row_data["Price_KES"] = "100000"
-
-        # Stock: always 0
         row_data["Stock"]     = "0"
         row_data["stock"]     = "0"
-
-        # (Color Family assignment block removed entirely as requested)
 
         # Short description
         if short_descs and i < len(short_descs) and short_descs[i]:
             row_data["short_description"] = short_descs[i]
 
-        # Determine if this row should be red (size missing from sizes.txt)
         flag_red = is_fashion and is_size_missing(computed_var, valid_sizes or [])
 
-        # Write cells using the bulletproof normalized headers
+        # Write cells to Excel
         for tmpl_col, value in row_data.items():
             norm_tmpl_col = re.sub(r'[^a-z0-9]', '', str(tmpl_col).lower())
             
@@ -1348,11 +1355,15 @@ if queries:
         else:
             _exp_to_path = {}
 
-        def _code_to_path(code):
-            return _exp_to_path.get(str(code).strip(), code) if code else ""
+        # Formats the preview category to explicitly show "CODE - PATH"
+        def _code_to_full(code):
+            c = str(code).strip()
+            if not c:
+                return ""
+            p = _exp_to_path.get(c, c)
+            return f"{c} - {p}" if c != p else p
 
         # ── 4. Compute auto variations & categories for preview ───────────────
-        # Per-row size overrides live in session state keyed by dataframe positional index
         if "size_overrides" not in st.session_state:
             st.session_state.size_overrides = {}
 
@@ -1360,10 +1371,10 @@ if queries:
         preview.reset_index(drop=True, inplace=True)
 
         if ai_categories:
-            preview["_primary_cat"] = [_code_to_path(c[0]) for c in ai_categories]
+            preview["_primary_cat"] = [_code_to_full(c[0]) for c in ai_categories]
         elif df_cat is not None:
             kw = keyword_match_batch(preview, df_cat)
-            preview["_primary_cat"] = [_code_to_path(c[0]) for c in kw]
+            preview["_primary_cat"] = [_code_to_full(c[0]) for c in kw]
         else:
             preview["_primary_cat"] = ""
 
@@ -1404,27 +1415,28 @@ if queries:
 
         preview["_export_name"] = preview.apply(_export_name, axis=1)
 
-        display_cols = ["sku_num_sku_r3", "_export_name", "color", "size",
-                        "_variation", "_primary_cat", "brand_name", "bar_code", "_size_ok"]
-        show_cols    = [c for c in display_cols if c in preview.columns]
+        # Explicitly separate the column names so you know exactly which mode is active
+        if is_fashion:
+            preview["Size_Export"] = preview["_variation"]
+            display_cols = ["sku_num_sku_r3", "_export_name", "color", "Size_Export", "_primary_cat", "brand_name", "bar_code", "_size_ok"]
+        else:
+            preview["Variation_Export"] = preview["_variation"]
+            display_cols = ["sku_num_sku_r3", "_export_name", "color", "Variation_Export", "_primary_cat", "brand_name", "bar_code", "_size_ok"]
+
+        show_cols = [c for c in display_cols if c in preview.columns]
 
         col_cfg = {
-            "sku_num_sku_r3":  st.column_config.TextColumn("SKU",              width="small"),
-            "_export_name":    st.column_config.TextColumn("Name (export)",     width="large"),
-            "color":           st.column_config.TextColumn("Colour",            width="medium"),
-            "size":            st.column_config.TextColumn("Size (master)",      width="medium"),
-            "_variation":      st.column_config.TextColumn(
-                                   "Size (validated)" if is_fashion else "Variation",
-                                   width="medium"),
-            "_primary_cat":    st.column_config.TextColumn("Primary Category",  width="large"),
-            "brand_name":      st.column_config.TextColumn("Brand",             width="small"),
-            "bar_code":        st.column_config.TextColumn("Barcode",           width="medium"),
-            "_size_ok":        st.column_config.CheckboxColumn("Size OK",        width="small"),
+            "sku_num_sku_r3":   st.column_config.TextColumn("SKU",                width="small"),
+            "_export_name":     st.column_config.TextColumn("Name (export)",      width="large"),
+            "color":            st.column_config.TextColumn("Colour",             width="medium"),
+            "Size_Export":      st.column_config.TextColumn("Size (Export)",      width="medium"),
+            "Variation_Export": st.column_config.TextColumn("Variation (Export)", width="medium"),
+            "_primary_cat":     st.column_config.TextColumn("Primary Category",   width="large"),
+            "brand_name":       st.column_config.TextColumn("Brand",              width="small"),
+            "bar_code":         st.column_config.TextColumn("Barcode",            width="medium"),
+            "_size_ok":         st.column_config.CheckboxColumn("Size OK",        width="small"),
         }
 
-        # NOTE: Streamlit ignores column_config when a Styler object is passed,
-        # which was hiding the size/variation columns. Use a plain DataFrame and
-        # replace the red-row highlight with a ⚠️ status column instead.
         df_display = preview[show_cols].copy()
         if is_fashion and "_size_ok" in df_display.columns:
             df_display.insert(0, "⚠️", df_display["_size_ok"].apply(

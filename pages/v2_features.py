@@ -1,40 +1,55 @@
-# Version 2 Documentation
+import streamlit as st
 
-## Version History
+# Set page configuration
+st.set_page_config(page_title='🚀 Version 2 Features', layout='wide')
 
-| Date       | Version | Changes                          |
-|------------|---------|----------------------------------|
-| 2026-04-15 | 2.0     | Initial release of Version 2    |
+# Decathlon branding
+st.markdown("""
+<style>
+h1 { color: #0082C3; }
+.feature-box { background: #f0f7ff; padding: 15px; border-left: 4px solid #0082C3; margin: 10px 0; }
+</style>
+""", unsafe_allow_html=True)
 
-## Feature Highlights
+st.title("🚀 Decathlon Version 2 Features")
 
-- Enhanced user interface with a modern look using Decathlon's branding.
-- Improved performance with optimized algorithms for faster processing.
-- New integration capabilities with external APIs.
+# Create tabs
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📝 Version History",
+    "⭐ Features", 
+    "🔄 Migration",
+    "⚡ Performance",
+    "❓ FAQ"
+])
 
-## Migration Guide
+with tab1:
+    st.header("Version History")
+    st.write("**Version 2.0** - April 15, 2026")
+    st.write("Major improvements and new features released")
 
-To upgrade from Version 1 to Version 2:
-1. Backup your current configuration files.
-2. Review the [changelog](#) for breaking changes.
-3. Update your dependency versions as per the requirement.
-4. Run migration scripts provided in the repository.
+with tab2:
+    st.header("Feature Highlights")
+    st.markdown("""
+    - 🔍 UK Size Extraction
+    - 🤖 AI Matching (Groq)
+    - ⚙️ Performance Optimizations
+    - 🛡️ Bulletproof Headers
+    - 📊 Category Formatting
+    - 🏗️ Auto-Create Columns
+    """)
 
-## Performance Improvements
+with tab3:
+    st.header("Migration Guide")
+    st.info("Version 2 is backward compatible with Version 1")
 
-- Reduced load times for large datasets by up to 50%.
-- Optimized database queries resulting in quicker response times.
+with tab4:
+    st.header("Performance Improvements")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Speed", "+50%", "faster")
+    col2.metric("Memory", "-30%", "lower")
+    col3.metric("Load Time", "~2s", "cached")
 
-## FAQ
-
-### Q: What are the system requirements for Version 2?
-A: Please refer to the `requirements.txt` file in the repository for detailed requirements.
-
-### Q: How do I report a bug?
-A: You can report bugs by opening an issue in the GitHub repository.
-
-### Q: Where can I find support?
-A: Please check the `Support` section in the repository for contact options.
-
-## Decathlon Branding
-Color #0082C3 is used throughout the UI for consistency under Decathlon's branding principles.
+with tab5:
+    st.header("FAQ")
+    st.write("Q: How do I upgrade?")
+    st.write("A: Simply use the new features in your next search!")

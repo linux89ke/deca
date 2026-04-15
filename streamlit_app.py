@@ -14,6 +14,7 @@ Fixes & improvements in this version:
  - PERF: keyword scoring vectorised with numpy; brand match cached per unique brand string;
          category batch pre-resolved once; is_size_missing uses a cached frozenset
  - BULLETPROOF HEADERS: Export mapping completely ignores spaces, underscores, and capitalization.
+ - MASTER MAPPING: Description pulls directly from the 'description' column.
 """
 
 import os, io, re, json, asyncio
@@ -69,7 +70,7 @@ SIZES_PATH    = "sizes.txt"
 
 MASTER_TO_TEMPLATE = {
     "product_name":    "Name",
-    "designed_for":    "Description",
+    "description":     "Description",  # Fixed to point to the actual description column
     "sku_num_sku_r3":  "SellerSKU",
     "brand_name":      "Brand",
     "bar_code":        "GTIN_Barcode",
@@ -84,7 +85,7 @@ TEMPLATE_IMAGE_SLOTS = ["MainImage"] + [f"Image{i}" for i in range(2, 9)]
 CATEGORY_MATCH_FIELDS = [
     "family", "type", "department_label", "nature_label",
     "proposed_brand_name", "brand_name", "color", "channable_gender",
-    "size", "keywords", "designed_for", "business_weight", "product_name",
+    "size", "keywords", "description", "business_weight", "product_name",
 ]
 
 GROQ_SYSTEM_CAT = """You are a product categorization expert for a sports retailer.
@@ -541,7 +542,7 @@ def rule_based_short_desc(row: pd.Series) -> str:
     b1_parts = [p for p in [brand, sport, gender] if p]
     if b1_parts:
         bullets.append(" · ".join(b1_parts))
-    desc = _clean(row.get("designed_for", ""))
+    desc = _clean(row.get("description", ""))  # Fixed to use 'description'
     quality_phrases = _extract_quality_phrases(desc, max_phrases=2)
     if quality_phrases:
         bullets.append(" · ".join(quality_phrases))
@@ -675,7 +676,7 @@ def _build_desc_query_per_model(group_df: pd.DataFrame) -> str:
         _clean(row.get("department_label", "")),
         _clean(row.get("brand_name", "")),
         _clean(row.get("channable_gender", "")).split("|")[0].strip(),
-        _clean(row.get("designed_for", ""))[:300],
+        _clean(row.get("description", ""))[:300],  # Fixed to use 'description'
         _clean(row.get("keywords", ""))[:100],
     ]
     return "|".join(p for p in parts if p)
@@ -892,11 +893,16 @@ def build_template(
             valid_sizes=valid_sizes,
             size_override=per_row_override,
         )
+        
+        # Dynamically find the exact column header in your Excel template (case-insensitive)
+        size_header = next((h for h in header_map if str(h).lower() == "size"), "size")
+        var_header  = next((h for h in header_map if str(h).lower() == "variation"), "variation")
 
         if is_fashion:
-            row_data["size"] = computed_var
+            row_data[size_header] = computed_var
+            row_data[var_header]  = computed_var  # Fills both Size and Variation so nothing is blank!
         else:
-            row_data["variation"] = computed_var
+            row_data[var_header]  = computed_var
 
         # Price_KES: always 100,000
         row_data["price"]     = "100000"

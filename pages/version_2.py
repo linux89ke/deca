@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import io
-import json
 import re
 import time
 import random
+import concurrent.futures
 from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import urljoin
@@ -123,11 +123,17 @@ def classify(title="", handle=""):
     return _first_match(blob, _AUDIENCE), _first_match(blob, _DEPT)
 
 # ═══════════════════════════════════════════════════════════
-# HTTP SESSION
+# HTTP — thread-safe session factory
 # ═══════════════════════════════════════════════════════════
 
 def make_session() -> requests.Session:
     s = requests.Session()
+    # Large connection pool so threads don't queue on sockets
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=20, pool_maxsize=20, max_retries=0
+    )
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
     s.headers.update({
         "User-Agent":      random.choice(USER_AGENTS),
         "Accept-Language": "en-KE,en;q=0.9",
@@ -137,38 +143,32 @@ def make_session() -> requests.Session:
     })
     return s
 
-def fetch(session: requests.Session, url: str, retries: int = 3,
-          delay=(1, 2), log=print):
+def fetch_url(session: requests.Session, url: str,
+              retries: int = 2) -> str | None:
+    """Return HTML text or None. No delays — caller controls timing."""
     for attempt in range(1, retries + 1):
         try:
-            r = session.get(url, timeout=20, allow_redirects=True)
+            r = session.get(url, timeout=15, allow_redirects=True)
             if r.status_code == 200:
-                return r
-            log(f"  ⚠️ HTTP {r.status_code} (attempt {attempt}/{retries})")
-        except Exception as e:
-            log(f"  ⚠️ Error: {str(e)[:80]} (attempt {attempt}/{retries})")
+                return r.text
+        except Exception:
+            pass
         if attempt < retries:
-            time.sleep(random.uniform(*delay))
+            time.sleep(0.3)
     return None
 
 # ═══════════════════════════════════════════════════════════
-# HELPERS
+# PAGE PARSER
 # ═══════════════════════════════════════════════════════════
 
 def parse_product_url(href: str):
-    """Extract model_id and sku from /p/{model}-{sku}-{slug}.html"""
     m = re.search(r'/p/(\d+)-(\d+)-', href)
     return (m.group(1), m.group(2)) if m else ("", "")
 
-# ═══════════════════════════════════════════════════════════
-# CATEGORY PAGE PARSER
-# ═══════════════════════════════════════════════════════════
-
-def parse_category_page(html: str) -> list[dict]:
+def parse_page(html: str) -> list[dict]:
     soup  = BeautifulSoup(html, "lxml")
     cards = soup.select("a[href*='/p/']")
 
-    # Deduplicate by href
     seen, unique = set(), []
     for c in cards:
         href = c.get("href", "")
@@ -182,27 +182,22 @@ def parse_category_page(html: str) -> list[dict]:
         product_url = urljoin(BASE_URL, href)
         model_id, sku = parse_product_url(href)
 
-        # ── Title ──────────────────────────────────────────
+        # Title
         img   = card.select_one("img")
-        title = ""
-        if img:
-            title = img.get("alt", "").strip()
-        if not title:
-            title = card.get("aria-label", "").strip()
+        title = (img.get("alt", "") if img else "") or card.get("aria-label", "")
+        title = re.sub(r",?\s*press enter to access product page.*$",
+                       "", title, flags=re.I).strip()
         if not title:
             title = card.get_text(" ", strip=True)[:80]
-        title = re.sub(
-            r",?\s*press enter to access product page.*$", "", title, flags=re.I
-        ).strip()
 
-        # ── Images ─────────────────────────────────────────
+        # Images
         image_urls = []
         for im in card.select("img"):
             src = im.get("src") or im.get("data-src") or ""
             if src and "mediadecathlon" in src and src not in image_urls:
                 image_urls.append(src)
 
-        # ── Price ──────────────────────────────────────────
+        # Price
         card_text = card.get_text(" ", strip=True)
         prices = []
         for p in re.findall(r'KES\s*([\d,]+\.?\d*)', card_text):
@@ -216,7 +211,7 @@ def parse_category_page(html: str) -> list[dict]:
         if min_price and original_price and original_price > min_price:
             discount_pct = round((1 - min_price / original_price) * 100)
 
-        # ── Rating ─────────────────────────────────────────
+        # Rating
         rating = ""
         rm = re.search(r'([\d.]+)\s*out of 5', card_text)
         if rm:
@@ -226,7 +221,6 @@ def parse_category_page(html: str) -> list[dict]:
                 pass
 
         review_count = ""
-        # Last number in card text is usually the review count
         nums = re.findall(r'\b(\d[\d,]*)\b', card_text)
         if nums:
             try:
@@ -234,7 +228,6 @@ def parse_category_page(html: str) -> list[dict]:
             except Exception:
                 pass
 
-        # ── Brand / Audience / Dept ─────────────────────────
         brand          = detect_brand(title=title, handle=href)
         audience, dept = classify(title=title, handle=href)
 
@@ -264,19 +257,19 @@ def parse_category_page(html: str) -> list[dict]:
     return products
 
 # ═══════════════════════════════════════════════════════════
-# PRODUCT PAGE ENRICHMENT (optional — brand + description)
+# ENRICHMENT  (product page — brand + description)
 # ═══════════════════════════════════════════════════════════
 
-def enrich_from_product_page(session, product: dict,
-                              delay=(1, 2), log=print) -> dict:
-    resp = fetch(session, product["product_url"], retries=2, delay=delay, log=log)
-    if not resp:
+def enrich_one(args):
+    """Called from thread pool. args = (session, product)"""
+    session, product = args
+    html = fetch_url(session, product["product_url"], retries=2)
+    if not html:
         return product
 
-    soup = BeautifulSoup(resp.text, "lxml")
+    soup = BeautifulSoup(html, "lxml")
 
-    # ── Brand ──────────────────────────────────────────────
-    # On decathlon.co.ke the brand appears as standalone UPPERCASE text before <h1>
+    # Brand — uppercase block before <h1>
     if not product.get("brand"):
         h1 = soup.select_one("h1")
         if h1:
@@ -286,18 +279,15 @@ def enrich_from_product_page(session, product: dict,
                     product["brand"] = text.title()
                     break
 
-    # Fallback — try known selectors
     if not product.get("brand"):
-        for sel in ["[class*='manufacturer']", "[class*='brand']",
-                    "[itemprop='brand']", ".product-manufacturer"]:
+        for sel in ["[class*='manufacturer']", "[class*='brand']", "[itemprop='brand']"]:
             el = soup.select_one(sel)
             if el:
                 product["brand"] = el.get_text(strip=True).title()
                 break
 
-    # ── Description ────────────────────────────────────────
-    for sel in ["[class*='description']", "[class*='product-desc']",
-                "div.rte", "p.product-shortdesc", "p"]:
+    # Description
+    for sel in ["[class*='description']", "[class*='product-desc']", "div.rte", "p"]:
         el = soup.select_one(sel)
         if el:
             text = el.get_text(" ", strip=True)
@@ -306,11 +296,10 @@ def enrich_from_product_page(session, product: dict,
                 break
 
     product["source_method"] = "product-page"
-    time.sleep(random.uniform(*delay))
     return product
 
 # ═══════════════════════════════════════════════════════════
-# SCRAPER ORCHESTRATOR
+# FAST PARALLEL SCRAPER
 # ═══════════════════════════════════════════════════════════
 
 @dataclass
@@ -318,74 +307,127 @@ class Cfg:
     category_path:  str
     category_label: str
     max_pages:      int      = 10
-    delay:          tuple    = (1, 2)
-    retries:        int      = 2
+    workers:        int      = 8     # parallel page fetches
     enrich:         bool     = False
+    enrich_workers: int      = 10    # parallel product page fetches
+    retries:        int      = 2
     log:            Callable = field(default=print, repr=False)
 
 
+def _page_url(path: str, page: int) -> str:
+    return f"{BASE_URL}{path}" + (f"?page={page}" if page > 1 else "")
+
+
 def run_scrape(cfg: Cfg) -> list:
-    cfg.log(f"🚀 **Decathlon Kenya** | {cfg.category_label} | max pages: {cfg.max_pages}")
+    cfg.log(f"🚀 **Decathlon Kenya** | {cfg.category_label} | max pages: {cfg.max_pages} | workers: {cfg.workers}")
     cfg.log("---")
-    session  = make_session()
-    products = []
 
-    for page_num in range(1, cfg.max_pages + 1):
-        url = (f"{BASE_URL}{cfg.category_path}"
-               + (f"?page={page_num}" if page_num > 1 else ""))
-        cfg.log(f"  📦 Page {page_num} → {url}")
+    session = make_session()
 
-        resp = fetch(session, url, retries=cfg.retries, delay=cfg.delay, log=cfg.log)
-        if not resp:
-            cfg.log("  ❌ Failed to fetch — stopping.")
-            break
+    # ── Step 1: fetch page 1 to check it returns products ──
+    cfg.log(f"  📡 Probing page 1…")
+    html1 = fetch_url(session, _page_url(cfg.category_path, 1), retries=cfg.retries)
+    if not html1:
+        cfg.log("  ❌ Could not reach category page.")
+        return []
 
-        page_prods = parse_category_page(resp.text)
+    first_prods = parse_page(html1)
+    if not first_prods:
+        cfg.log("  ❌ No products on page 1.")
+        return []
 
-        if not page_prods:
-            cfg.log(f"  ⛔ No products on page {page_num} — end of category.")
-            break
+    cfg.log(f"  ✅ Page 1: {len(first_prods)} products")
 
-        existing = {p["product_url"] for p in products}
-        new      = [p for p in page_prods if p["product_url"] not in existing]
+    # ── Step 2: fetch remaining pages IN PARALLEL ───────────
+    remaining = list(range(2, cfg.max_pages + 1))
+    all_products = list(first_prods)
+    seen_urls    = {p["product_url"] for p in all_products}
 
-        if not new:
-            cfg.log(f"  ⛔ No new products on page {page_num} — end of pagination.")
-            break
+    if remaining:
+        cfg.log(f"  ⚡ Fetching pages 2–{cfg.max_pages} with {cfg.workers} workers…")
 
-        products.extend(new)
-        cfg.log(f"  ✅ +{len(new)} products (total: {len(products)})")
-        time.sleep(random.uniform(*cfg.delay))
+        def fetch_and_parse(page_num):
+            url  = _page_url(cfg.category_path, page_num)
+            html = fetch_url(session, url, retries=cfg.retries)
+            if not html:
+                return page_num, []
+            prods = parse_page(html)
+            return page_num, prods
 
-    # ── Optional enrichment ────────────────────────────────
-    if cfg.enrich and products:
-        cfg.log(f"  🔍 Enriching {len(products)} products from product pages…")
-        for i, p in enumerate(products, 1):
-            cfg.log(f"  🔍 [{i}/{len(products)}] {p['title'][:55]}")
-            products[i - 1] = enrich_from_product_page(
-                session, p, delay=cfg.delay, log=cfg.log
-            )
+        # Use threads — I/O bound, safe for requests
+        with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.workers) as ex:
+            futures = {ex.submit(fetch_and_parse, p): p for p in remaining}
+            for fut in concurrent.futures.as_completed(futures):
+                page_num, prods = fut.result()
+                if not prods:
+                    cfg.log(f"  ⛔ Page {page_num}: empty — skipping.")
+                    continue
+                new = [p for p in prods if p["product_url"] not in seen_urls]
+                if not new:
+                    cfg.log(f"  ⛔ Page {page_num}: no new products.")
+                    continue
+                for p in new:
+                    seen_urls.add(p["product_url"])
+                all_products.extend(new)
+                cfg.log(f"  ✅ Page {page_num}: +{len(new)} (total: {len(all_products)})")
 
-    cfg.log(f"✅ Done. **{len(products)} products** collected.")
-    return products
+    cfg.log(f"  📦 {len(all_products)} unique products collected.")
+
+    # ── Step 3: optional parallel enrichment ────────────────
+    if cfg.enrich and all_products:
+        cfg.log(f"  🔍 Enriching {len(all_products)} products with {cfg.enrich_workers} workers…")
+        prog = st.progress(0, text="Enriching…")
+        args = [(session, p) for p in all_products]
+
+        enriched = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.enrich_workers) as ex:
+            for i, result in enumerate(ex.map(enrich_one, args), 1):
+                enriched.append(result)
+                prog.progress(i / len(all_products),
+                              text=f"Enriching {i}/{len(all_products)}…")
+        prog.empty()
+        all_products = enriched
+        cfg.log(f"  ✅ Enrichment complete.")
+
+    cfg.log(f"✅ Done. **{len(all_products)} products** ready.")
+    return all_products
 
 # ═══════════════════════════════════════════════════════════
 # EXPORTS
 # ═══════════════════════════════════════════════════════════
 
-def to_csv(df):
+def to_csv(df: pd.DataFrame) -> bytes:
     buf = io.StringIO()
     df.to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8")
 
-def to_json_bytes(df):
+def to_json_bytes(df: pd.DataFrame) -> bytes:
     return df.to_json(orient="records", force_ascii=False, indent=2).encode("utf-8")
 
-def to_excel(df):
+def to_excel(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name="Products")
     return buf.getvalue()
+
+def render_downloads(df: pd.DataFrame, label: str):
+    """Persistent download buttons — always rendered from session_state."""
+    safe  = re.sub(r"[^\w]", "_", label)
+    fname = f"decathlon_ke_{safe}"
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.download_button("📄 CSV", to_csv(df),
+                           f"{fname}.csv", "text/csv",
+                           use_container_width=True, key="dl_csv")
+    with d2:
+        st.download_button("📋 JSON", to_json_bytes(df),
+                           f"{fname}.json", "application/json",
+                           use_container_width=True, key="dl_json")
+    with d3:
+        st.download_button("📊 Excel", to_excel(df),
+                           f"{fname}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           use_container_width=True, key="dl_xlsx")
 
 # ═══════════════════════════════════════════════════════════
 # STREAMLIT UI
@@ -393,7 +435,12 @@ def to_excel(df):
 
 st.set_page_config(page_title="Decathlon Kenya Scraper", page_icon="🛒", layout="wide")
 st.title("🛒 Decathlon Kenya Scraper")
-st.caption(f"Target: **{BASE_URL}** — Direct category scraping, no browser needed.")
+st.caption(f"Target: **{BASE_URL}** — Parallel category scraping, no browser needed.")
+
+# Session state init
+if "products"  not in st.session_state: st.session_state.products  = []
+if "cat_label" not in st.session_state: st.session_state.cat_label = ""
+if "df_show"   not in st.session_state: st.session_state.df_show   = None
 
 with st.sidebar:
     st.header("⚙️ Configuration")
@@ -407,32 +454,33 @@ with st.sidebar:
     all_pages = st.toggle("📄 Scrape ALL pages", value=False)
     max_pages = 9999 if all_pages else st.slider("Max pages", 1, 50, 10)
     if all_pages:
-        st.caption("⚠️ No page limit — may take several minutes.")
+        st.caption("⚠️ No page limit.")
 
-    delay_min, delay_max = st.slider("Delay between requests (s)", 0, 5, (1, 2))
-    retries = st.slider("Retries per request", 1, 4, 2)
+    workers = st.slider("⚡ Parallel workers", 1, 20, 8,
+                        help="Higher = faster but more load on the server.")
 
     st.divider()
     enrich = st.toggle(
         "🔍 Enrich from product pages",
         value=False,
-        help="Visits every product page for accurate brand + description. Much slower.",
+        help="Fetches brand + description from each product page. Parallel but still slower.",
     )
-    export_cols = st.multiselect(
-        "Export columns", ALL_EXPORT_COLUMNS, default=ALL_EXPORT_COLUMNS
-    )
+    enrich_workers = st.slider("Enrich workers", 1, 20, 10) if enrich else 10
+
+    export_cols = st.multiselect("Export columns", ALL_EXPORT_COLUMNS,
+                                 default=ALL_EXPORT_COLUMNS)
     st.divider()
     run_btn = st.button("▶️ Start Scraping", type="primary", use_container_width=True)
 
-# ── Run ────────────────────────────────────────────────────
+# ── Scrape ─────────────────────────────────────────────────
 if run_btn:
     cfg = Cfg(
         category_path=cat_path,
         category_label=cat_label,
         max_pages=max_pages,
-        delay=(delay_min, delay_max),
-        retries=retries,
+        workers=workers,
         enrich=enrich,
+        enrich_workers=enrich_workers,
     )
 
     log_lines: list = []
@@ -446,7 +494,7 @@ if run_btn:
             status_box.info(f"⏳ {totals[-1].strip()}")
         log_box.markdown(
             '<div style="background:#0e1117;padding:12px;border-radius:8px;'
-            'font-family:monospace;font-size:12px;max-height:300px;overflow-y:auto;">'
+            'font-family:monospace;font-size:12px;max-height:260px;overflow-y:auto;">'
             + "<br>".join(log_lines[-60:]) + "</div>",
             unsafe_allow_html=True,
         )
@@ -454,85 +502,83 @@ if run_btn:
     cfg.log = log
     with st.spinner(f"Scraping {cat_label}…"):
         products = run_scrape(cfg)
+
+    log_box.empty()
     status_box.empty()
 
     if not products:
         st.error("No products found. Try a different category.")
         st.stop()
 
+    # Save to session state so results survive button clicks
     df = pd.DataFrame(products)
     cols_present = [c for c in export_cols if c in df.columns]
-    df_show = df[cols_present] if cols_present else df
+    st.session_state.products  = products
+    st.session_state.cat_label = cat_label
+    st.session_state.df_show   = df[cols_present] if cols_present else df
+
+# ── Render results (from session state — persists across reruns) ──
+if st.session_state.products:
+    products  = st.session_state.products
+    cat_label = st.session_state.cat_label
+    df_show   = st.session_state.df_show
 
     st.success(f"✅ **{len(products)}** products from **{cat_label}**")
 
-    # ── Metrics ────────────────────────────────────────────
+    # Metrics
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Products", len(products))
-    brands_found = {p.get("brand","") for p in products if p.get("brand")}
-    c2.metric("Brands", len(brands_found))
+    c2.metric("Brands", len({p.get("brand","") for p in products if p.get("brand")}))
     vp = [float(p["min_price"]) for p in products if p.get("min_price")]
     c3.metric("Avg (KES)", f"{sum(vp)/len(vp):,.0f}" if vp else "—")
     c4.metric("Min (KES)", f"{min(vp):,.0f}" if vp else "—")
     c5.metric("Max (KES)", f"{max(vp):,.0f}" if vp else "—")
 
-    # ── Brand breakdown ────────────────────────────────────
+    # Breakdowns
     st.divider()
+    df_full = pd.DataFrame(products)
     col_a, col_b, col_c = st.columns(3)
     with col_a:
-        brd = df["brand"].replace("", "Unknown").value_counts()
-        st.markdown("**Brand breakdown**")
-        st.dataframe(brd.rename("count"), use_container_width=True)
+        st.markdown("**Brand**")
+        st.dataframe(df_full["brand"].replace("","Unknown").value_counts().rename("count"),
+                     use_container_width=True)
     with col_b:
-        aud = df["audience"].replace("", "Unclassified").value_counts()
         st.markdown("**Audience**")
-        st.dataframe(aud.rename("count"), use_container_width=True)
+        st.dataframe(df_full["audience"].replace("","Unclassified").value_counts().rename("count"),
+                     use_container_width=True)
     with col_c:
-        dep = df["department"].replace("", "Unclassified").value_counts()
         st.markdown("**Department**")
-        st.dataframe(dep.rename("count"), use_container_width=True)
+        st.dataframe(df_full["department"].replace("","Unclassified").value_counts().rename("count"),
+                     use_container_width=True)
 
-    # ── Discount summary ───────────────────────────────────
-    disc_df = df[df["discount_pct"].astype(str) != ""]
+    disc_df = df_full[df_full["discount_pct"].astype(str) != ""]
     if not disc_df.empty:
         st.info(f"🏷️ **{len(disc_df)}** products on sale "
-                f"(avg {disc_df['discount_pct'].mean():.0f}% off)")
+                f"(avg {pd.to_numeric(disc_df['discount_pct'], errors='coerce').mean():.0f}% off)")
 
-    # ── Image preview ──────────────────────────────────────
+    # Images
     st.divider()
     with st.expander("🖼️ Image preview (first 12)", expanded=False):
         ic = st.columns(4)
         shown = 0
         for p in products:
-            url = p.get("image_url_1", "")
+            url = p.get("image_url_1","")
             if url and shown < 12:
                 with ic[shown % 4]:
                     try:
                         st.image(url, caption=(p.get("title",""))[:40],
                                  use_container_width=True)
                     except Exception:
-                        st.write(p.get("title", ""))
+                        st.write(p.get("title",""))
                 shown += 1
 
-    # ── Table ──────────────────────────────────────────────
+    # Table
     st.subheader("📋 Results")
     st.dataframe(df_show, use_container_width=True, height=440)
 
-    # ── Export ─────────────────────────────────────────────
-    st.subheader("⬇️ Export")
-    safe_name = re.sub(r"[^\w]", "_", cat_label)
-    fname = f"decathlon_ke_{safe_name}"
-    d1, d2, d3 = st.columns(3)
-    with d1:
-        st.download_button("📄 CSV", to_csv(df_show),
-                           f"{fname}.csv", "text/csv", use_container_width=True)
-    with d2:
-        st.download_button("📋 JSON", to_json_bytes(df_show),
-                           f"{fname}.json", "application/json", use_container_width=True)
-    with d3:
-        st.download_button("📊 Excel", to_excel(df_show), f"{fname}.xlsx",
-                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
+    # Downloads — rendered from session_state, survive any click
+    st.subheader("⬇️ Download")
+    render_downloads(df_show, cat_label)
 
 else:
     st.info("👈 Pick a category and press **Start Scraping**.")

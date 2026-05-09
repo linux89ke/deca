@@ -9,3 +9,4 @@ groq
 beautifulsoup4
 cloudscraper
 lxml
+playwright

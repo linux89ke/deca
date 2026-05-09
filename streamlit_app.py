@@ -27,9 +27,10 @@ from urllib.parse import urlencode, urljoin, quote
 
 # ── Playwright Setup ──────────────────────────────────────────────────────────
 # CRITICAL FIX for Streamlit Cloud: 
-# Forces Playwright to install and look for browsers in the local Python environment
-# instead of the user's home directory, avoiding adminuser vs appuser mismatches.
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+# Forces Playwright to install and look for browsers in a local workspace folder
+# instead of the user's home directory or Python environment, completely bypassing
+# the adminuser/appuser mismatches and read-only file system issues.
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(os.getcwd(), "pw-browsers")
 from playwright.sync_api import sync_playwright
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -325,6 +326,7 @@ def ensure_playwright_installed():
     try:
         # Use sys.executable to ensure we install inside the correct Python environment
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        print("Playwright browsers successfully installed to local directory.")
     except subprocess.CalledProcessError as e:
         print(f"Playwright install failed.")
     except Exception as e:

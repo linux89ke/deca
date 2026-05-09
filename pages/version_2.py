@@ -98,6 +98,83 @@ def get_with_retry(session, url, params=None, delay=(2, 4), retries=3, log=None)
             time.sleep(random.uniform(3, 7))
     return None
 
+# ── Audience & Department helpers ────────────────────────────────────────────
+
+# Keywords searched across tags, product_type, title, description, URL handle
+# Order matters — more specific patterns first
+
+AUDIENCE_RULES = [
+    # Kids / children first (most specific)
+    ("Kids",  [
+        r"\benfant[s]?\b", r"\bjunior[s]?\b", r"\bkid[s]?\b", r"\bchild\b", r"\bchildren\b",
+        r"\bgamin[s]?\b", r"\bfille[s]?\b", r"\bgar[çc]on[s]?\b", r"\bboy[s]?\b", r"\bgirl[s]?\b",
+        r"\b\d+[-\s]?\d*\s*ans\b",   # e.g. "3-8 ans"
+        r"\byouth\b", r"\bbaby\b", r"\bbébé\b", r"\bnourrisson\b",
+    ]),
+    # Women
+    ("Women", [
+        r"\bfemme[s]?\b", r"\bwoman\b", r"\bwomen\b", r"\bféminin\b", r"\bfeminine\b",
+        r"\bwomens\b", r"\bladies\b", r"\bladie\b", r"\bdame[s]?\b",
+    ]),
+    # Men
+    ("Men",   [
+        r"\bhomme[s]?\b", r"\bman\b", r"\bmen\b", r"\bmasculin\b", r"\bmensculine\b",
+        r"\bmens\b", r"\bgentlemen\b",
+    ]),
+]
+
+DEPARTMENT_RULES = [
+    ("Cycling",         [r"\bv[eé]lo[s]?\b", r"\bcycl", r"\bvtt\b", r"\bbiking\b", r"\bbike[s]?\b", r"\bcyclisme\b"]),
+    ("Running",         [r"\brunning\b", r"\bcourse\b", r"\bjogging\b", r"\bmarathon\b"]),
+    ("Football",        [r"\bfootball\b", r"\bfoot\b", r"\bsoccer\b"]),
+    ("Swimming",        [r"\bnatation\b", r"\bswim", r"\bpiscine\b", r"\bpool\b"]),
+    ("Tennis",          [r"\btennis\b", r"\bradquet\b", r"\bracquet\b"]),
+    ("Hiking",          [r"\brand[oé]nn", r"\bhiking\b", r"\btrekking\b", r"\btrail\b", r"\bmontagne\b"]),
+    ("Fitness",         [r"\bfitness\b", r"\bgym\b", r"\bmusculat", r"\bcardio\b", r"\byoga\b", r"\bpilates\b"]),
+    ("Skiing",          [r"\bski\b", r"\bsnow\b", r"\bpiste\b", r"\balpine\b"]),
+    ("Basketball",      [r"\bbasketball\b", r"\bbasket\b"]),
+    ("Camping",         [r"\bcamping\b", r"\btente\b", r"\bcamp\b", r"\bbivouac\b"]),
+    ("Water Sports",    [r"\bsurf\b", r"\bkayak\b", r"\bcanoe\b", r"\bpaddle\b", r"\bplongée\b", r"\bdiving\b"]),
+    ("Martial Arts",    [r"\bjudo\b", r"\bkarate\b", r"\bboxe\b", r"\bboxing\b", r"\bmartial\b"]),
+    ("Rugby",           [r"\brugby\b"]),
+    ("Volleyball",      [r"\bvolleyball\b", r"\bvolley\b"]),
+    ("Golf",            [r"\bgolf\b"]),
+    ("Equestrian",      [r"\béquitation\b", r"\bhorse\b", r"\briding\b"]),
+    ("Clothing",        [r"\bvêtement[s]?\b", r"\btee.shirt\b", r"\bjacket\b", r"\bveste\b", r"\bpantalon\b", r"\bshort[s]?\b", r"\blegging[s]?\b"]),
+    ("Footwear",        [r"\bchaussure[s]?\b", r"\bshoe[s]?\b", r"\bbasket[s]?\b", r"\bsneaker[s]?\b", r"\bboot[s]?\b"]),
+    ("Accessories",     [r"\baccessoire[s]?\b", r"\bsac[s]?\b", r"\bbag[s]?\b", r"\bbonnet\b", r"\bgant[s]?\b"]),
+]
+
+
+def _match_rules(text_blob, rules):
+    """Return the first rule label whose patterns match anywhere in text_blob."""
+    blob = text_blob.lower()
+    for label, patterns in rules:
+        for pat in patterns:
+            if re.search(pat, blob):
+                return label
+    return ""
+
+
+def extract_audience_and_department(title="", tags="", product_type="", description="", handle=""):
+    """
+    Returns (audience, department) by searching title, tags, product_type,
+    description and URL handle for known keyword patterns.
+    """
+    # Build a single searchable blob, weighted: title+tags first (most reliable)
+    blob = " ".join([
+        title or "",
+        tags or "",
+        product_type or "",
+        handle or "",
+        description or "",
+    ])
+
+    audience   = _match_rules(blob, AUDIENCE_RULES)
+    department = _match_rules(blob, DEPARTMENT_RULES)
+    return audience, department
+
+
 # ── Method 1: Shopify /products.json ─────────────────────────────────────────
 
 def scrape_products_json(base_url, keyword, max_pages, delay, log):
@@ -126,33 +203,101 @@ def scrape_products_json(base_url, keyword, max_pages, delay, log):
     return products
 
 
+def _extract_decathlon_ids(handle="", sku="", tags="", product_id=""):
+    """
+    Decathlon encodes two IDs:
+      model_id    — the product family (R-p-XXXXXX in URL, or numeric part of handle)
+                    Same for all sizes/colours of one product.
+      sku / article_code — specific variant (mc=XXXXXXXX in URL, or variants[].sku)
+
+    Sources tried in order:
+      1. variants[0].sku  → Decathlon stores article codes here (e.g. "8403218")
+      2. handle           → slug like "velo-vtt-rockrider-st100-27-5-homme-R-p-170575"
+                            the R-p-XXXXXX suffix IS the model ID
+      3. tags             → Decathlon sometimes tags with "ModelId_XXXXXX"
+      4. Shopify product id → fallback numeric id
+    """
+    model_id = ""
+    article_sku = sku or ""  # variants[0].sku passed in
+
+    # Extract model_id from handle: "...-R-p-170575" or "...-p-170575"
+    if handle:
+        m = re.search(r'[Rr]-p-(\d+)', handle)
+        if m:
+            model_id = m.group(1)
+        else:
+            # Some handles end with just the numeric id: "velo-adulte-123456"
+            m2 = re.search(r'-(\d{5,8})$', handle)
+            if m2:
+                model_id = m2.group(1)
+
+    # Try tags for ModelId
+    if not model_id and tags:
+        m = re.search(r'ModelId[_\-:](\d+)', tags, re.IGNORECASE)
+        if m:
+            model_id = m.group(1)
+
+    # Fallback to Shopify product id
+    if not model_id and product_id:
+        model_id = str(product_id)
+
+    return model_id, article_sku
+
+
 def _parse_shopify_product(p, base_url):
     image_urls = [img.get("src", "") for img in p.get("images", [])]
+    raw_variants = p.get("variants", [])
     variants = []
-    for v in p.get("variants", []):
+    for v in raw_variants:
         variants.append({
-            "variant_id":   v.get("id"),
-            "title":        v.get("title"),
-            "sku":          v.get("sku"),
-            "price":        v.get("price"),
-            "compare_at":   v.get("compare_at_price"),
-            "available":    v.get("available"),
-            "option1":      v.get("option1"),
-            "option2":      v.get("option2"),
+            "variant_id":    v.get("id"),
+            "title":         v.get("title"),
+            "sku":           v.get("sku"),           # article code per variant
+            "price":         v.get("price"),
+            "compare_at":    v.get("compare_at_price"),
+            "available":     v.get("available"),
+            "option1":       v.get("option1"),        # usually size
+            "option2":       v.get("option2"),        # usually colour
         })
     available_prices = [
-        float(v["price"]) for v in p.get("variants", [])
+        float(v["price"]) for v in raw_variants
         if v.get("available") and v.get("price")
     ]
-    handle = p.get("handle", "")
+    handle   = p.get("handle", "")
+    tags_str = ", ".join(p.get("tags", []))
     desc_html = p.get("body_html", "") or ""
     desc_text = BeautifulSoup(desc_html, "html.parser").get_text(" ", strip=True)
+
+    # SKU: use first variant's sku as the representative article code
+    first_sku = raw_variants[0].get("sku", "") if raw_variants else ""
+    # All unique SKUs across variants (one per size/colour combo)
+    all_skus = list(dict.fromkeys(v.get("sku","") for v in raw_variants if v.get("sku")))
+
+    model_id, article_sku = _extract_decathlon_ids(
+        handle=handle,
+        sku=first_sku,
+        tags=tags_str,
+        product_id=p.get("id",""),
+    )
+
+    audience, department = extract_audience_and_department(
+        title=p.get("title", ""),
+        tags=tags_str,
+        product_type=p.get("product_type", ""),
+        description=desc_text,
+        handle=handle,
+    )
     return {
         "product_id":    p.get("id"),
+        "model_id":      model_id,       # product family (R-p-XXXXXX)
+        "sku":           article_sku,    # article code of first/default variant
+        "all_skus":      " | ".join(all_skus),  # all variant SKUs pipe-separated
         "title":         p.get("title"),
         "brand":         p.get("vendor"),
+        "audience":      audience,
+        "department":    department,
         "product_type":  p.get("product_type"),
-        "tags":          ", ".join(p.get("tags", [])),
+        "tags":          tags_str,
         "product_url":   f"{base_url}/products/{handle}" if handle else "",
         "min_price":     min(available_prices) if available_prices else "",
         "currency":      "EUR",
@@ -261,13 +406,32 @@ def _parse_next_product(p, base_url):
     except Exception:
         price = price_raw
 
+    slug = str(g("url","href","productUrl","slug"))
+    model_id, article_sku = _extract_decathlon_ids(
+        handle=slug,
+        sku=str(g("sku","articleCode","articleId","skuId","")),
+        tags=str(g("tags","")),
+        product_id=str(g("id","modelId","productId","modelRef","")),
+    )
+    audience, department = extract_audience_and_department(
+        title=str(g("title","name","label","productLabel")),
+        tags=str(g("tags","")),
+        product_type=str(g("category","productType","type")),
+        description=str(g("description","shortDescription","subtitle")),
+        handle=slug,
+    )
     return {
         "product_id":    g("id","modelId","productId","modelRef"),
+        "model_id":      model_id,
+        "sku":           article_sku,
+        "all_skus":      "",
         "title":         g("title","name","label","productLabel"),
         "brand":         g("brand","brandLabel","vendor","maker"),
+        "audience":      audience,
+        "department":    department,
         "product_type":  g("category","productType","type"),
         "tags":          "",
-        "product_url":   urljoin(base_url, g("url","href","productUrl","slug")),
+        "product_url":   urljoin(base_url, slug),
         "min_price":     price,
         "currency":      g("currency","currencyCode") or "EUR",
         "image_count":   len(image_urls),
@@ -364,16 +528,37 @@ def _parse_html_card(card, base_url, selector):
     )
     price_clean = re.sub(r"[^\d,\.]", "", price_text).replace(",", ".").strip(".")
 
-    return {
-        "product_id":    card.get("data-id") or card.get("data-product-id") or "",
-        "title":         text(
+    title_val = text(
             "[data-testid='product-card-name']", "p.vtmn-card_title",
             "[class*='product-name']", "[class*='ProductName']", "h2", "h3", "p"
-        ),
-        "brand":         text(
+        )
+    brand_val = text(
             "[data-testid='product-card-brand']", "[class*='brand']",
             "span[class*='Brand']"
-        ),
+        )
+    # SKU / model from data attributes or URL
+    raw_sku  = (card.get("data-sku") or card.get("data-article-code")
+                or card.get("data-product-code") or "")
+    raw_model = (card.get("data-model-id") or card.get("data-model")
+                 or card.get("data-id") or card.get("data-product-id") or "")
+    model_id, article_sku = _extract_decathlon_ids(
+        handle=product_url,
+        sku=raw_sku,
+        product_id=raw_model,
+    )
+    audience, department = extract_audience_and_department(
+        title=title_val,
+        handle=product_url,
+    )
+    return {
+        "product_id":    raw_model,
+        "model_id":      model_id,
+        "sku":           article_sku,
+        "all_skus":      "",
+        "title":         title_val,
+        "brand":         brand_val,
+        "audience":      audience,
+        "department":    department,
         "product_type":  "",
         "tags":          "",
         "product_url":   product_url,
@@ -481,12 +666,14 @@ with st.sidebar:
     st.markdown("**Fields to export**")
     export_cols = st.multiselect(
         "Columns",
-        ["product_id","title","brand","product_type","tags",
+        ["product_id","model_id","sku","all_skus",
+         "title","brand","audience","department","product_type","tags",
          "product_url","min_price","currency",
          "image_count","image_url_1","image_url_2","image_url_3","all_image_urls",
          "variant_count","option_names","variants_json",
          "description","published_at","updated_at","source_method"],
-        default=["title","brand","min_price","currency","product_url",
+        default=["model_id","sku","title","brand","audience","department",
+                 "min_price","currency","product_url",
                  "image_url_1","all_image_urls","variant_count","description"]
     )
 

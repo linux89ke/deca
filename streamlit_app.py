@@ -522,7 +522,8 @@ def run_scrape(base_url, keyword, max_pages, delay, log):
 
     products = []
     with sync_playwright() as p:
-        # Pass executable_path directly — bypasses all env-var resolution at runtime
+        # Build launch kwargs — pass executable_path only when we found the binary,
+        # so Playwright does not have to resolve it via env vars at runtime.
         launch_kwargs: dict = {"headless": True}
         if CHROMIUM_EXECUTABLE:
             launch_kwargs["executable_path"] = CHROMIUM_EXECUTABLE
@@ -618,7 +619,7 @@ _all_pages = all_pages
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 
-# Show browser status banner before anything else
+# Show browser status banner
 if CHROMIUM_EXECUTABLE:
     st.success(f"✅ Browser ready: `{CHROMIUM_EXECUTABLE}`")
 else:

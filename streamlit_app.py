@@ -316,8 +316,15 @@ def _parse_html_card(card, base_url, selector):
 
 @st.cache_resource(show_spinner=False)
 def ensure_playwright_installed():
-    import os
-    os.system("playwright install chromium")
+    import subprocess
+    import sys
+    try:
+        # Use sys.executable to ensure we install inside the correct Python environment on Streamlit Cloud
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Playwright install failed: {e.stderr.decode()}")
+    except Exception as e:
+        print(f"Playwright installation error: {e}")
 
 def _try_shopify_api(page, base_url, keyword, max_pages, delay, log):
     products = []

@@ -314,15 +314,15 @@ def _parse_html_card(card, base_url, selector):
 
 # ── Playwright Scraping Logic ─────────────────────────────────────────────────
 
-@st.cache_resource(show_spinner=False)
 def ensure_playwright_installed():
     import subprocess
     import sys
     try:
-        # Use sys.executable to ensure we install inside the correct Python environment on Streamlit Cloud
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, capture_output=True)
+        # Use sys.executable to ensure we install inside the correct Python environment
+        # We removed capture_output=True so you can see progress in the Streamlit Cloud console
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
     except subprocess.CalledProcessError as e:
-        print(f"Playwright install failed: {e.stderr.decode()}")
+        print(f"Playwright install failed.")
     except Exception as e:
         print(f"Playwright installation error: {e}")
 

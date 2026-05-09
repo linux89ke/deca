@@ -15,6 +15,8 @@ How it works:
 """
 
 import os
+import subprocess
+import sys
 import streamlit as st
 import json
 import io
@@ -26,11 +28,12 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlencode, urljoin, quote
 
 # ── Playwright Setup ──────────────────────────────────────────────────────────
-# CRITICAL FIX for Streamlit Cloud: 
-# Forces Playwright to install and look for browsers in a local workspace folder
-# instead of the user's home directory or Python environment, completely bypassing
-# the adminuser/appuser mismatches and read-only file system issues.
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(os.getcwd(), "pw-browsers")
+# Pin the browser install path to a writable local folder inside the app's
+# working directory. This sidesteps the adminuser/appuser home-dir mismatch
+# on Streamlit Cloud and any read-only filesystem issues.
+PW_BROWSERS_PATH = os.path.join(os.getcwd(), "pw-browsers")
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = PW_BROWSERS_PATH
+
 from playwright.sync_api import sync_playwright
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -40,6 +43,35 @@ st.set_page_config(
     page_icon="🛒",
     layout="wide",
 )
+
+# ── Install Playwright browsers once at startup ───────────────────────────────
+# st.cache_resource ensures this runs exactly once per server session,
+# not on every rerun or button click.
+
+@st.cache_resource(show_spinner="⏳ Installing Playwright browser (first run only)…")
+def ensure_playwright_installed():
+    """
+    Installs Chromium into PW_BROWSERS_PATH.
+    Explicitly passes the env var to the subprocess so the browser
+    lands in — and is later found in — the correct directory.
+    """
+    pw_env = {**os.environ, "PLAYWRIGHT_BROWSERS_PATH": PW_BROWSERS_PATH}
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            env=pw_env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        print("Playwright install stdout:", result.stdout)
+        print("Playwright install stderr:", result.stderr)
+    except subprocess.CalledProcessError as e:
+        print("Playwright install failed:", e.stderr)
+    except Exception as e:
+        print("Playwright installation error:", e)
+
+ensure_playwright_installed()
 
 # ── Country map ───────────────────────────────────────────────────────────────
 
@@ -76,7 +108,7 @@ AUDIENCE_RULES = [
     ("Kids",  [
         r"\benfant[s]?\b", r"\bjunior[s]?\b", r"\bkid[s]?\b", r"\bchild\b", r"\bchildren\b",
         r"\bgamin[s]?\b", r"\bfille[s]?\b", r"\bgar[çc]on[s]?\b", r"\bboy[s]?\b", r"\bgirl[s]?\b",
-        r"\b\d+[-\s]?\d*\s*ans\b",   # e.g. "3-8 ans"
+        r"\b\d+[-\s]?\d*\s*ans\b",
         r"\byouth\b", r"\bbaby\b", r"\bbébé\b", r"\bnourrisson\b",
     ]),
     ("Women", [
@@ -171,7 +203,7 @@ def _parse_shopify_product(p, base_url):
 
     model_id, article_sku = _extract_decathlon_ids(handle=handle, sku=first_sku, tags=tags_str, product_id=p.get("id",""))
     audience, department = extract_audience_and_department(title=p.get("title", ""), tags=tags_str, product_type=p.get("product_type", ""), description=desc_text, handle=handle)
-    
+
     return {
         "product_id":    p.get("id"),
         "model_id":      model_id,
@@ -231,7 +263,7 @@ def _parse_next_product(p, base_url):
     slug = str(g("url","href","productUrl","slug"))
     model_id, article_sku = _extract_decathlon_ids(handle=slug, sku=str(g("sku","articleCode","articleId","skuId","")), tags=str(g("tags","")), product_id=str(g("id","modelId","productId","modelRef","")))
     audience, department = extract_audience_and_department(title=str(g("title","name","label","productLabel")), tags=str(g("tags","")), product_type=str(g("category","productType","type")), description=str(g("description","shortDescription","subtitle")), handle=slug)
-    
+
     return {
         "product_id":    g("id","modelId","productId","modelRef"),
         "model_id":      model_id,
@@ -285,10 +317,10 @@ def _parse_html_card(card, base_url, selector):
     brand_val = text("[data-testid='product-card-brand']", "[class*='brand']", "span[class*='Brand']")
     raw_sku  = card.get("data-sku") or card.get("data-article-code") or card.get("data-product-code") or ""
     raw_model = card.get("data-model-id") or card.get("data-model") or card.get("data-id") or card.get("data-product-id") or ""
-    
+
     model_id, article_sku = _extract_decathlon_ids(handle=product_url, sku=raw_sku, product_id=raw_model)
     audience, department = extract_audience_and_department(title=title_val, handle=product_url)
-    
+
     return {
         "product_id":    raw_model,
         "model_id":      model_id,
@@ -320,18 +352,6 @@ def _parse_html_card(card, base_url, selector):
 
 # ── Playwright Scraping Logic ─────────────────────────────────────────────────
 
-def ensure_playwright_installed():
-    import subprocess
-    import sys
-    try:
-        # Use sys.executable to ensure we install inside the correct Python environment
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-        print("Playwright browsers successfully installed to local directory.")
-    except subprocess.CalledProcessError as e:
-        print(f"Playwright install failed.")
-    except Exception as e:
-        print(f"Playwright installation error: {e}")
-
 def _try_shopify_api(page, base_url, keyword, max_pages, delay, log):
     products = []
     for page_num in range(1, max_pages + 1):
@@ -340,19 +360,18 @@ def _try_shopify_api(page, base_url, keyword, max_pages, delay, log):
         try:
             response = page.goto(url, wait_until="domcontentloaded", timeout=20000)
             time.sleep(random.uniform(*delay))
-            
-            # Extract JSON cleanly
+
             try:
                 data = response.json()
-            except:
+            except Exception:
                 content = page.locator("body").inner_text()
                 data = json.loads(content)
-                
+
             page_prods = data.get("products", [])
             if not page_prods:
                 log(f"  ✅ No more products on page {page_num}.")
                 break
-                
+
             for p in page_prods:
                 products.append(_parse_shopify_product(p, base_url))
             log(f"  ✅ Got {len(page_prods)} products (total: {len(products)})")
@@ -364,31 +383,29 @@ def _try_shopify_api(page, base_url, keyword, max_pages, delay, log):
 def _try_web_scraping(page, base_url, keyword, max_pages, delay, log):
     products = []
     for page_num in range(1, max_pages + 1):
-        # We try multiple query strings as different Decathlon sites use different params.
         url = f"{base_url}/search?Ntt={quote(keyword)}&query={quote(keyword)}&page={page_num}"
         log(f"🔍 [Web Scrape] Page {page_num} → {url}")
-        
+
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
         except Exception as e:
             log(f"  ❌ Navigation failed or timeout: {e}")
             break
-            
+
         sleep_time = random.uniform(*delay)
         log(f"  Waiting {sleep_time:.1f}s for React/JS to render...")
         time.sleep(sleep_time)
-        
-        # Scroll to trigger lazy loading / image rendering
+
         page.evaluate("window.scrollTo(0, document.body.scrollHeight/3)")
         time.sleep(1)
         page.evaluate("window.scrollTo(0, document.body.scrollHeight/1.5)")
         time.sleep(1)
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         time.sleep(1)
-        
+
         html = page.content()
         soup = BeautifulSoup(html, "html.parser")
-        
+
         page_success = False
 
         # --- Method 2: Try __NEXT_DATA__ ---
@@ -404,7 +421,7 @@ def _try_web_scraping(page, base_url, keyword, max_pages, delay, log):
                     page_success = True
             except Exception as e:
                 log(f"  ⚠️ Error parsing __NEXT_DATA__: {e}")
-                
+
         # --- Method 3: Try HTML Fallback ---
         if not page_success:
             log("  🔧 Falling back to HTML/BS4 parsing...")
@@ -418,7 +435,7 @@ def _try_web_scraping(page, base_url, keyword, max_pages, delay, log):
                 "div[class*='ProductCard']",
                 "li.ais-Hits-item",
                 "div[class*='product-block']",
-                "div.dpb-models", 
+                "div.dpb-models",
             ]
             cards = []
             used_selector = None
@@ -428,7 +445,7 @@ def _try_web_scraping(page, base_url, keyword, max_pages, delay, log):
                     used_selector = sel
                     log(f"  ✅ Found {len(cards)} cards with selector: {sel}")
                     break
-            
+
             if cards:
                 for card in cards:
                     products.append(_parse_html_card(card, base_url, used_selector))
@@ -436,9 +453,8 @@ def _try_web_scraping(page, base_url, keyword, max_pages, delay, log):
                 page_success = True
             else:
                 log("  ❌ No product cards found with known selectors.")
-                # We may have hit the end of the pages or a layout we don't recognize
                 break
-                
+
         if not page_success:
             break
 
@@ -449,9 +465,6 @@ def run_scrape(base_url, keyword, max_pages, delay, log):
     pages_label = "ALL" if max_pages == 9999 else str(max_pages)
     log(f"🚀 Starting Playwright scrape: **{base_url}** | keyword: `{keyword}` | pages: {pages_label}")
     log("---")
-
-    log("⏳ Ensuring Playwright browsers are installed...")
-    ensure_playwright_installed()
 
     products = []
     with sync_playwright() as p:
@@ -465,18 +478,18 @@ def run_scrape(base_url, keyword, max_pages, delay, log):
         )
         page = context.new_page()
 
-        # Try Method 1
+        # Try Method 1: Shopify API
         log("### Method 1: Shopify /products.json")
         products = _try_shopify_api(page, base_url, keyword, max_pages, delay, log)
-        
+
         # If Method 1 fails, try Web scraping (Methods 2 & 3 combined)
         if not products:
             log("⚠️  Method 1 failed or returned nothing. Attempting Web Scraping...")
             log("---")
             products = _try_web_scraping(page, base_url, keyword, max_pages, delay, log)
-            
+
         browser.close()
-        
+
     return products if products else []
 
 # ── Export helpers ────────────────────────────────────────────────────────────
@@ -565,7 +578,6 @@ if run_btn:
 
     def log(msg):
         log_messages.append(msg)
-        found = sum(1 for m in log_messages if "total:" in m)
         if all_pages and progress:
             totals = [m for m in log_messages if "total:" in m]
             total_so_far = totals[-1].split("total:")[-1].strip().rstrip(")") if totals else "0"
@@ -604,7 +616,7 @@ if run_btn:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Products", len(products))
     c2.metric("Pages scraped", pages_actually_scraped)
-    prices = [p["min_price"] for p in products if p.get("min_price") not in ("","",None)]
+    prices = [p["min_price"] for p in products if p.get("min_price") not in ("", "", None)]
     c3.metric("Avg price (€)", f"{sum(float(x) for x in prices)/len(prices):.2f}" if prices else "—")
     brands = {p.get("brand","") for p in products if p.get("brand")}
     c4.metric("Unique brands", len(brands))

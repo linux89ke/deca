@@ -7,3 +7,4 @@ openpyxl
 scikit-learn
 groq
 beautifulsoup4
+playwright

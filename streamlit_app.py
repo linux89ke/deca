@@ -14,6 +14,7 @@ How it works:
   5. Falls back to parsing raw HTML with BeautifulSoup CSS selectors.
 """
 
+import os
 import streamlit as st
 import json
 import io
@@ -24,7 +25,11 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from urllib.parse import urlencode, urljoin, quote
 
-# Playwright
+# ── Playwright Setup ──────────────────────────────────────────────────────────
+# CRITICAL FIX for Streamlit Cloud: 
+# Forces Playwright to install and look for browsers in the local Python environment
+# instead of the user's home directory, avoiding adminuser vs appuser mismatches.
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
 from playwright.sync_api import sync_playwright
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -319,7 +324,6 @@ def ensure_playwright_installed():
     import sys
     try:
         # Use sys.executable to ensure we install inside the correct Python environment
-        # We removed capture_output=True so you can see progress in the Streamlit Cloud console
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
     except subprocess.CalledProcessError as e:
         print(f"Playwright install failed.")

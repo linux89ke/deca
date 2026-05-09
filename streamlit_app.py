@@ -87,7 +87,7 @@ USER_AGENTS: list[str] = [
     "Chrome/122.0.0.0 Safari/537.36",
 ]
 
-# Chromium args required in sandboxed/containerised cloud environments
+# Chromium args required in sandboxed / containerised cloud environments
 CHROMIUM_ARGS: list[str] = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
@@ -266,7 +266,6 @@ def classify(title: str = "", tags: str = "", product_type: str = "",
 def extract_ids(handle: str = "", sku: str = "", tags: str = "",
                 product_id: str = "") -> tuple[str, str]:
     model_id = ""
-    # Pattern 1: Decathlon URL handle  e.g. "R-p-123456"
     if handle:
         m = re.search(r'[Rr]-p-(\d+)', handle)
         if m:
@@ -275,12 +274,10 @@ def extract_ids(handle: str = "", sku: str = "", tags: str = "",
             m = re.search(r'-(\d{5,8})(?:[/?#]|$)', handle)
             if m:
                 model_id = m.group(1)
-    # Pattern 2: tag like "ModelId:123456"
     if not model_id and tags:
         m = re.search(r'ModelId[_\-:](\d+)', tags, re.IGNORECASE)
         if m:
             model_id = m.group(1)
-    # Fallback: raw product_id
     if not model_id and product_id:
         model_id = str(product_id)
     return model_id, sku or ""
@@ -392,7 +389,6 @@ def parse_shopify_product(p: dict, base_url: str) -> dict:
 
 
 def _walk_for_product_lists(data: Any, depth: int = 0) -> list[list]:
-    """Recursively find list-of-dicts that look like product arrays."""
     results = []
     if depth > 7:
         return results
@@ -543,21 +539,19 @@ def parse_html_card(card: Any, base_url: str) -> dict:
 class ScrapeConfig:
     base_url:  str
     keyword:   str
-    max_pages: int        = 5
-    delay:     tuple      = (2, 4)
-    retries:   int        = 2
-    log:       Callable   = field(default=print, repr=False)
+    max_pages: int      = 5
+    delay:     tuple    = (2, 4)
+    retries:   int      = 2
+    log:       Callable = field(default=print, repr=False)
 
 
 def _slow_scroll(page: Page) -> None:
-    """Gradually scroll to trigger lazy-load and SPA rendering."""
     for frac in (0.33, 0.66, 1.0):
         page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {frac})")
         time.sleep(0.8)
 
 
 def _goto_with_retry(page: Page, url: str, retries: int, log: Callable) -> bool:
-    """Navigate with retry on timeout. Returns True on success."""
     for attempt in range(1, retries + 2):
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=40_000)
@@ -568,8 +562,6 @@ def _goto_with_retry(page: Page, url: str, retries: int, log: Callable) -> bool:
                 time.sleep(3)
     return False
 
-
-# ── Strategy 1: Shopify /products.json ───────────────────────────────────────
 
 def _scrape_shopify(page: Page, cfg: ScrapeConfig) -> Optional[list[dict]]:
     products: list[dict] = []
@@ -584,8 +576,6 @@ def _scrape_shopify(page: Page, cfg: ScrapeConfig) -> Optional[list[dict]]:
         try:
             resp = page.goto(url, wait_until="domcontentloaded", timeout=20_000)
             time.sleep(random.uniform(*cfg.delay))
-
-            # Parse JSON — try response object first, then body text
             try:
                 data = resp.json()
             except Exception:
@@ -602,12 +592,10 @@ def _scrape_shopify(page: Page, cfg: ScrapeConfig) -> Optional[list[dict]]:
 
         except Exception as exc:
             cfg.log(f"  ❌ Shopify API failed: {str(exc)[:120]}")
-            return None   # Signal: strategy failed, try next one
+            return None
 
     return products if products else None
 
-
-# ── Strategy 2: __NEXT_DATA__ embedded JSON ──────────────────────────────────
 
 def _extract_next_data(html: str, base_url: str, log: Callable) -> Optional[list[dict]]:
     m = re.search(
@@ -629,8 +617,6 @@ def _extract_next_data(html: str, base_url: str, log: Callable) -> Optional[list
         return None
 
 
-# ── Strategy 3: HTML / BeautifulSoup ─────────────────────────────────────────
-
 def _extract_html(html: str, base_url: str, log: Callable) -> Optional[list[dict]]:
     soup = BeautifulSoup(html, "lxml")
     for sel in _HTML_SELECTORS:
@@ -641,8 +627,6 @@ def _extract_html(html: str, base_url: str, log: Callable) -> Optional[list[dict
     log("  ❌ No matching HTML selectors found.")
     return None
 
-
-# ── Web scraping orchestrator (strategies 2 + 3) ─────────────────────────────
 
 def _scrape_web(page: Page, cfg: ScrapeConfig) -> list[dict]:
     products: list[dict] = []
@@ -674,12 +658,8 @@ def _scrape_web(page: Page, cfg: ScrapeConfig) -> list[dict]:
         _slow_scroll(page)
 
         html = page.content()
-        page_products: Optional[list[dict]] = None
-
-        # Try Next.js data first (faster, more complete)
         page_products = _extract_next_data(html, cfg.base_url, cfg.log)
 
-        # Fall back to HTML parsing
         if not page_products:
             cfg.log("  🔧 Falling back to HTML/BS4…")
             page_products = _extract_html(html, cfg.base_url, cfg.log)
@@ -694,24 +674,13 @@ def _scrape_web(page: Page, cfg: ScrapeConfig) -> list[dict]:
     return products
 
 
-# ── Main entry point ─────────────────────────────────────────────────────────
-
 def run_scrape(cfg: ScrapeConfig) -> list[dict]:
-    """
-    Runs all strategies in order:
-      1. Shopify /products.json  (fast, complete)
-      2. Web scraping            (__NEXT_DATA__ or HTML fallback)
-    Returns a deduplicated list of product dicts.
-    """
     pages_label = "ALL" if cfg.max_pages == 9999 else str(cfg.max_pages)
     cfg.log(f"🚀 **{cfg.base_url}** | keyword: `{cfg.keyword}` | max pages: {pages_label}")
     cfg.log(f"🖥 Chromium: `{CHROMIUM_EXECUTABLE or 'auto-detect'}`")
     cfg.log("---")
 
-    products: list[dict] = []
-
     with browser_page(stealth=True) as page:
-        # Strategy 1
         result = _scrape_shopify(page, cfg)
         if result:
             products = result
@@ -752,13 +721,12 @@ def to_excel(df: pd.DataFrame) -> bytes:
 
 st.set_page_config(page_title="Decathlon Scraper v3", page_icon="🛒", layout="wide")
 
-# ── Browser status banner ─────────────────────────────────────────────────────
 if CHROMIUM_EXECUTABLE:
     st.success(f"✅ Chromium ready: `{CHROMIUM_EXECUTABLE}`")
 else:
     st.error(
-        "❌ Chromium binary not found. Scraping will fail. "
-        "Add the system packages listed in `packages.txt` and redeploy."
+        "❌ Chromium binary not found. Add system packages listed in "
+        "`packages.txt` to your repo root and redeploy."
     )
 
 st.title("🛒 Decathlon Scraper v3")
@@ -767,7 +735,6 @@ st.caption(
     "for any Decathlon country site."
 )
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Configuration")
 
@@ -777,36 +744,28 @@ with st.sidebar:
 
     keyword = st.text_input("Search keyword", value="vélo")
 
-    all_pages_toggle = st.toggle(
-        "📄 Scrape ALL pages", value=False,
-        help="Continues until no more results. Can be slow.",
-    )
+    all_pages_toggle = st.toggle("📄 Scrape ALL pages", value=False,
+                                 help="Continues until no more results. Can be slow.")
     if all_pages_toggle:
         st.caption("⚠️ No page limit — runs until the site returns empty results.")
         max_pages = 9999
     else:
-        max_pages = st.slider("Max pages", 1, 100, 5,
-                              help="~24 products per page.")
+        max_pages = st.slider("Max pages", 1, 100, 5, help="~24 products per page.")
 
     delay_min, delay_max = st.slider(
         "Delay between requests (s)", 1, 10, (2, 4),
         help="Longer delays reduce the chance of getting blocked.",
     )
-
     retries = st.slider("Retries per page on failure", 0, 3, 1)
 
     st.divider()
     st.markdown("**Export columns**")
-    export_cols = st.multiselect(
-        "Select fields",
-        ALL_EXPORT_COLUMNS,
-        default=DEFAULT_EXPORT_COLUMNS,
-    )
+    export_cols = st.multiselect("Select fields", ALL_EXPORT_COLUMNS,
+                                 default=DEFAULT_EXPORT_COLUMNS)
 
     st.divider()
     run_btn = st.button("▶️ Start Scraping", type="primary", use_container_width=True)
 
-# ── Main scrape area ──────────────────────────────────────────────────────────
 if run_btn:
     if not keyword.strip():
         st.error("Please enter a search keyword.")
@@ -829,7 +788,6 @@ if run_btn:
 
     def log(msg: str) -> None:
         log_lines.append(msg)
-        # Count running total from log lines
         totals = [l for l in log_lines if "Running total:" in l or "unique products" in l]
         if totals:
             status_box.info(f"⏳ {totals[-1].strip()}")
@@ -852,47 +810,42 @@ if run_btn:
         st.error("No products found. Review the log above for clues.")
         st.stop()
 
-    # ── Build dataframe ───────────────────────────────────────────────────────
     df = pd.DataFrame(products)
     cols_present = [c for c in export_cols if c in df.columns]
     df_show = df[cols_present] if cols_present else df
 
     st.success(f"✅ **{len(products)}** products via `{products[0].get('source_method', '?')}`")
 
-    # ── KPI metrics ───────────────────────────────────────────────────────────
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Products",      len(products))
     c2.metric("Unique brands", len({p.get("brand", "") for p in products if p.get("brand")}))
 
     valid_prices = []
     for p in products:
-        v = p.get("min_price")
         try:
-            valid_prices.append(float(v))
+            valid_prices.append(float(p.get("min_price")))
         except Exception:
             pass
-    c3.metric("Avg price",  f"{sum(valid_prices)/len(valid_prices):.2f}" if valid_prices else "—")
-    c4.metric("Min price",  f"{min(valid_prices):.2f}"                   if valid_prices else "—")
-    c5.metric("Max price",  f"{max(valid_prices):.2f}"                   if valid_prices else "—")
+    c3.metric("Avg price", f"{sum(valid_prices)/len(valid_prices):.2f}" if valid_prices else "—")
+    c4.metric("Min price", f"{min(valid_prices):.2f}"                   if valid_prices else "—")
+    c5.metric("Max price", f"{max(valid_prices):.2f}"                   if valid_prices else "—")
 
     st.divider()
 
-    # ── Audience / Department breakdown ───────────────────────────────────────
     b1, b2 = st.columns(2)
     with b1:
-        aud_counts = df["audience"].value_counts() if "audience" in df.columns else pd.Series()
-        if not aud_counts.empty:
+        aud = df["audience"].value_counts() if "audience" in df.columns else pd.Series()
+        if not aud.empty:
             st.markdown("**Audience breakdown**")
-            st.dataframe(aud_counts.rename("count"), use_container_width=True)
+            st.dataframe(aud.rename("count"), use_container_width=True)
     with b2:
-        dep_counts = df["department"].value_counts() if "department" in df.columns else pd.Series()
-        if not dep_counts.empty:
+        dep = df["department"].value_counts() if "department" in df.columns else pd.Series()
+        if not dep.empty:
             st.markdown("**Department breakdown**")
-            st.dataframe(dep_counts.rename("count"), use_container_width=True)
+            st.dataframe(dep.rename("count"), use_container_width=True)
 
     st.divider()
 
-    # ── Image preview ─────────────────────────────────────────────────────────
     with st.expander("🖼️ Image preview (first 12)", expanded=False):
         img_cols = st.columns(4)
         shown = 0
@@ -906,11 +859,9 @@ if run_btn:
                         st.write(p.get("title", ""))
                 shown += 1
 
-    # ── Data table ────────────────────────────────────────────────────────────
     st.subheader("📋 Results")
     st.dataframe(df_show, use_container_width=True, height=420)
 
-    # ── Downloads ─────────────────────────────────────────────────────────────
     st.subheader("⬇️ Export")
     fname = f"decathlon_{keyword.replace(' ', '_')}"
     d1, d2, d3 = st.columns(3)
@@ -922,8 +873,7 @@ if run_btn:
                            f"{fname}.json", "application/json", use_container_width=True)
     with d3:
         st.download_button(
-            "📊 Excel", to_excel(df_show),
-            f"{fname}.xlsx",
+            "📊 Excel", to_excel(df_show), f"{fname}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )

@@ -15,8 +15,9 @@ How it works:
 """
 
 import os
-import subprocess
 import sys
+import subprocess
+import glob
 import streamlit as st
 import json
 import io
@@ -25,14 +26,14 @@ import random
 import re
 import pandas as pd
 from bs4 import BeautifulSoup
-from urllib.parse import urlencode, urljoin, quote
+from urllib.parse import urljoin, quote
 
 # ── Playwright Setup ──────────────────────────────────────────────────────────
-# Pin the browser install path to a writable local folder inside the app's
-# working directory. This sidesteps the adminuser/appuser home-dir mismatch
-# on Streamlit Cloud and any read-only filesystem issues.
-PW_BROWSERS_PATH = os.path.join(os.getcwd(), "pw-browsers")
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = PW_BROWSERS_PATH
+# Use /tmp — it is guaranteed writable by ALL users (adminuser AND appuser)
+# on Streamlit Cloud, unlike os.getcwd() or home directories.
+PLAYWRIGHT_BROWSERS_PATH = "/tmp/pw-browsers"
+os.makedirs(PLAYWRIGHT_BROWSERS_PATH, exist_ok=True)
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = PLAYWRIGHT_BROWSERS_PATH
 
 from playwright.sync_api import sync_playwright
 
@@ -45,33 +46,54 @@ st.set_page_config(
 )
 
 # ── Install Playwright browsers once at startup ───────────────────────────────
-# st.cache_resource ensures this runs exactly once per server session,
-# not on every rerun or button click.
+# Returns the absolute path to the Chromium executable so we can pass it
+# directly to p.chromium.launch(), bypassing all env-var lookup issues.
 
 @st.cache_resource(show_spinner="⏳ Installing Playwright browser (first run only)…")
-def ensure_playwright_installed():
+def install_playwright_and_get_path() -> str | None:
     """
-    Installs Chromium into PW_BROWSERS_PATH.
-    Explicitly passes the env var to the subprocess so the browser
-    lands in — and is later found in — the correct directory.
+    1. Installs Chromium into /tmp/pw-browsers via subprocess (with the env
+       var explicitly forwarded so the binary lands in the right place).
+    2. Globs for the actual executable and returns its path so we can pass
+       it as executable_path= to p.chromium.launch().
+    Cached — runs exactly once per server session.
     """
-    pw_env = {**os.environ, "PLAYWRIGHT_BROWSERS_PATH": PW_BROWSERS_PATH}
+    pw_env = {**os.environ, "PLAYWRIGHT_BROWSERS_PATH": PLAYWRIGHT_BROWSERS_PATH}
+
     try:
         result = subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium"],
             env=pw_env,
             capture_output=True,
             text=True,
-            check=True,
         )
-        print("Playwright install stdout:", result.stdout)
-        print("Playwright install stderr:", result.stderr)
-    except subprocess.CalledProcessError as e:
-        print("Playwright install failed:", e.stderr)
-    except Exception as e:
-        print("Playwright installation error:", e)
+        if result.returncode != 0:
+            st.warning(f"Playwright install stderr: {result.stderr[:300]}")
+        else:
+            print("Playwright install OK:", result.stdout[:200])
+    except Exception as exc:
+        st.error(f"Playwright install raised an exception: {exc}")
+        return None
 
-ensure_playwright_installed()
+    # Locate the binary — the folder structure changes between Playwright versions
+    search_patterns = [
+        f"{PLAYWRIGHT_BROWSERS_PATH}/**/chrome-headless-shell",
+        f"{PLAYWRIGHT_BROWSERS_PATH}/**/chromium",
+        f"{PLAYWRIGHT_BROWSERS_PATH}/**/chrome",
+    ]
+    for pattern in search_patterns:
+        hits = glob.glob(pattern, recursive=True)
+        # Filter to actual executable files
+        hits = [h for h in hits if os.path.isfile(h) and os.access(h, os.X_OK)]
+        if hits:
+            print(f"Found Chromium at: {hits[0]}")
+            return hits[0]
+
+    st.warning("Chromium binary not found after install. Will attempt launch without explicit path.")
+    return None
+
+
+CHROMIUM_EXECUTABLE = install_playwright_and_get_path()
 
 # ── Country map ───────────────────────────────────────────────────────────────
 
@@ -163,14 +185,17 @@ def _extract_decathlon_ids(handle="", sku="", tags="", product_id=""):
 
     if handle:
         m = re.search(r'[Rr]-p-(\d+)', handle)
-        if m: model_id = m.group(1)
+        if m:
+            model_id = m.group(1)
         else:
             m2 = re.search(r'-(\d{5,8})$', handle)
-            if m2: model_id = m2.group(1)
+            if m2:
+                model_id = m2.group(1)
 
     if not model_id and tags:
         m = re.search(r'ModelId[_\-:](\d+)', tags, re.IGNORECASE)
-        if m: model_id = m.group(1)
+        if m:
+            model_id = m.group(1)
 
     if not model_id and product_id:
         model_id = str(product_id)
@@ -185,24 +210,24 @@ def _parse_shopify_product(p, base_url):
     variants = []
     for v in raw_variants:
         variants.append({
-            "variant_id":    v.get("id"),
-            "title":         v.get("title"),
-            "sku":           v.get("sku"),
-            "price":         v.get("price"),
-            "compare_at":    v.get("compare_at_price"),
-            "available":     v.get("available"),
-            "option1":       v.get("option1"),
-            "option2":       v.get("option2"),
+            "variant_id": v.get("id"),
+            "title":      v.get("title"),
+            "sku":        v.get("sku"),
+            "price":      v.get("price"),
+            "compare_at": v.get("compare_at_price"),
+            "available":  v.get("available"),
+            "option1":    v.get("option1"),
+            "option2":    v.get("option2"),
         })
     available_prices = [float(v["price"]) for v in raw_variants if v.get("available") and v.get("price")]
     handle   = p.get("handle", "")
     tags_str = ", ".join(p.get("tags", []))
     desc_text = BeautifulSoup(p.get("body_html", "") or "", "html.parser").get_text(" ", strip=True)
     first_sku = raw_variants[0].get("sku", "") if raw_variants else ""
-    all_skus = list(dict.fromkeys(v.get("sku","") for v in raw_variants if v.get("sku")))
+    all_skus  = list(dict.fromkeys(v.get("sku", "") for v in raw_variants if v.get("sku")))
 
-    model_id, article_sku = _extract_decathlon_ids(handle=handle, sku=first_sku, tags=tags_str, product_id=p.get("id",""))
-    audience, department = extract_audience_and_department(title=p.get("title", ""), tags=tags_str, product_type=p.get("product_type", ""), description=desc_text, handle=handle)
+    model_id, article_sku = _extract_decathlon_ids(handle=handle, sku=first_sku, tags=tags_str, product_id=p.get("id", ""))
+    audience, department  = extract_audience_and_department(title=p.get("title", ""), tags=tags_str, product_type=p.get("product_type", ""), description=desc_text, handle=handle)
 
     return {
         "product_id":    p.get("id"),
@@ -235,60 +260,79 @@ def _parse_shopify_product(p, base_url):
 def _find_products_in_next_data(data):
     candidates = []
     def walk(obj, depth=0):
-        if depth > 6: return
+        if depth > 6:
+            return
         if isinstance(obj, list) and len(obj) > 0:
             first = obj[0]
-            if isinstance(first, dict) and any(k in first for k in ("title","name","id","price","modelRef")):
+            if isinstance(first, dict) and any(k in first for k in ("title", "name", "id", "price", "modelRef")):
                 candidates.append(obj)
         elif isinstance(obj, dict):
             for v in obj.values():
                 walk(v, depth + 1)
     walk(data)
-    if candidates: return max(candidates, key=len)
+    if candidates:
+        return max(candidates, key=len)
     return []
 
 def _parse_next_product(p, base_url):
     def g(*keys):
         for k in keys:
-            if k in p and p[k] not in (None, ""): return p[k]
+            if k in p and p[k] not in (None, ""):
+                return p[k]
         return ""
 
     images = p.get("images", p.get("media", []))
-    image_urls = [img.get("url", img.get("src", img.get("href", ""))) if isinstance(img, dict) else str(img) for img in images] if isinstance(images, list) else []
+    image_urls = (
+        [img.get("url", img.get("src", img.get("href", ""))) if isinstance(img, dict) else str(img) for img in images]
+        if isinstance(images, list) else []
+    )
 
-    price_raw = g("price","salePrice","currentPrice","priceMin")
-    try: price = float(str(price_raw).replace(",",".").replace("€","").strip())
-    except: price = price_raw
+    price_raw = g("price", "salePrice", "currentPrice", "priceMin")
+    try:
+        price = float(str(price_raw).replace(",", ".").replace("€", "").strip())
+    except Exception:
+        price = price_raw
 
-    slug = str(g("url","href","productUrl","slug"))
-    model_id, article_sku = _extract_decathlon_ids(handle=slug, sku=str(g("sku","articleCode","articleId","skuId","")), tags=str(g("tags","")), product_id=str(g("id","modelId","productId","modelRef","")))
-    audience, department = extract_audience_and_department(title=str(g("title","name","label","productLabel")), tags=str(g("tags","")), product_type=str(g("category","productType","type")), description=str(g("description","shortDescription","subtitle")), handle=slug)
+    slug = str(g("url", "href", "productUrl", "slug"))
+    model_id, article_sku = _extract_decathlon_ids(
+        handle=slug,
+        sku=str(g("sku", "articleCode", "articleId", "skuId", "")),
+        tags=str(g("tags", "")),
+        product_id=str(g("id", "modelId", "productId", "modelRef", "")),
+    )
+    audience, department = extract_audience_and_department(
+        title=str(g("title", "name", "label", "productLabel")),
+        tags=str(g("tags", "")),
+        product_type=str(g("category", "productType", "type")),
+        description=str(g("description", "shortDescription", "subtitle")),
+        handle=slug,
+    )
 
     return {
-        "product_id":    g("id","modelId","productId","modelRef"),
+        "product_id":    g("id", "modelId", "productId", "modelRef"),
         "model_id":      model_id,
         "sku":           article_sku,
         "all_skus":      "",
-        "title":         g("title","name","label","productLabel"),
-        "brand":         g("brand","brandLabel","vendor","maker"),
+        "title":         g("title", "name", "label", "productLabel"),
+        "brand":         g("brand", "brandLabel", "vendor", "maker"),
         "audience":      audience,
         "department":    department,
-        "product_type":  g("category","productType","type"),
+        "product_type":  g("category", "productType", "type"),
         "tags":          "",
         "product_url":   urljoin(base_url, slug),
         "min_price":     price,
-        "currency":      g("currency","currencyCode") or "EUR",
+        "currency":      g("currency", "currencyCode") or "EUR",
         "image_count":   len(image_urls),
-        "image_url_1":   image_urls[0] if len(image_urls) > 0 else g("image","thumbnail","imgUrl"),
+        "image_url_1":   image_urls[0] if len(image_urls) > 0 else g("image", "thumbnail", "imgUrl"),
         "image_url_2":   image_urls[1] if len(image_urls) > 1 else "",
         "image_url_3":   image_urls[2] if len(image_urls) > 2 else "",
         "all_image_urls": " | ".join(image_urls),
         "variant_count": len(p.get("variants", p.get("sizes", []))),
         "option_names":  "",
         "variants_json": json.dumps(p.get("variants", []), ensure_ascii=False),
-        "description":   g("description","shortDescription","subtitle")[:600],
-        "published_at":  g("publishedAt","createdAt"),
-        "updated_at":    g("updatedAt","modifiedAt"),
+        "description":   str(g("description", "shortDescription", "subtitle"))[:600],
+        "published_at":  g("publishedAt", "createdAt"),
+        "updated_at":    g("updatedAt", "modifiedAt"),
         "source_method": "__NEXT_DATA__",
     }
 
@@ -296,7 +340,8 @@ def _parse_html_card(card, base_url, selector):
     def text(*sels):
         for s in sels:
             el = card.select_one(s)
-            if el: return el.get_text(strip=True)
+            if el:
+                return el.get_text(strip=True)
         return ""
 
     link = card.select_one("a[href]")
@@ -305,21 +350,27 @@ def _parse_html_card(card, base_url, selector):
     imgs = card.select("img")
     image_urls = []
     for img in imgs:
-        src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or (img.get("srcset", "").split(" ")[0] if img.get("srcset") else "")
+        src = (
+            img.get("src")
+            or img.get("data-src")
+            or img.get("data-lazy-src")
+            or (img.get("srcset", "").split(" ")[0] if img.get("srcset") else "")
+        )
         if src and ("http" in src or "//" in src):
-            if src.startswith("//"): src = "https:" + src
+            if src.startswith("//"):
+                src = "https:" + src
             if "decathlon" in src or "source" in src:
                 image_urls.append(src)
 
-    price_text = text("[data-testid='price']", "span.vtmn-price", "[class*='price']", "span[class*='Price']", "div[class*='price']", "span[class*='amount']")
+    price_text  = text("[data-testid='price']", "span.vtmn-price", "[class*='price']", "span[class*='Price']", "div[class*='price']", "span[class*='amount']")
     price_clean = re.sub(r"[^\d,\.]", "", price_text).replace(",", ".").strip(".")
-    title_val = text("[data-testid='product-card-name']", "p.vtmn-card_title", "[class*='product-name']", "[class*='ProductName']", "h2", "h3", "p")
-    brand_val = text("[data-testid='product-card-brand']", "[class*='brand']", "span[class*='Brand']")
-    raw_sku  = card.get("data-sku") or card.get("data-article-code") or card.get("data-product-code") or ""
-    raw_model = card.get("data-model-id") or card.get("data-model") or card.get("data-id") or card.get("data-product-id") or ""
+    title_val   = text("[data-testid='product-card-name']", "p.vtmn-card_title", "[class*='product-name']", "[class*='ProductName']", "h2", "h3", "p")
+    brand_val   = text("[data-testid='product-card-brand']", "[class*='brand']", "span[class*='Brand']")
+    raw_sku     = card.get("data-sku") or card.get("data-article-code") or card.get("data-product-code") or ""
+    raw_model   = card.get("data-model-id") or card.get("data-model") or card.get("data-id") or card.get("data-product-id") or ""
 
     model_id, article_sku = _extract_decathlon_ids(handle=product_url, sku=raw_sku, product_id=raw_model)
-    audience, department = extract_audience_and_department(title=title_val, handle=product_url)
+    audience, department  = extract_audience_and_department(title=title_val, handle=product_url)
 
     return {
         "product_id":    raw_model,
@@ -380,6 +431,7 @@ def _try_shopify_api(page, base_url, keyword, max_pages, delay, log):
             return None
     return products
 
+
 def _try_web_scraping(page, base_url, keyword, max_pages, delay, log):
     products = []
     for page_num in range(1, max_pages + 1):
@@ -416,13 +468,14 @@ def _try_web_scraping(page, base_url, keyword, max_pages, delay, log):
                 data = json.loads(m.group(1))
                 page_prods = _find_products_in_next_data(data)
                 if page_prods:
-                    for p in page_prods: products.append(_parse_next_product(p, base_url))
+                    for p in page_prods:
+                        products.append(_parse_next_product(p, base_url))
                     log(f"  ✅ Got {len(page_prods)} products from Next.js data (total: {len(products)})")
                     page_success = True
             except Exception as e:
                 log(f"  ⚠️ Error parsing __NEXT_DATA__: {e}")
 
-        # --- Method 3: Try HTML Fallback ---
+        # --- Method 3: HTML fallback ---
         if not page_success:
             log("  🔧 Falling back to HTML/BS4 parsing...")
             selectors = [
@@ -464,17 +517,23 @@ def _try_web_scraping(page, base_url, keyword, max_pages, delay, log):
 def run_scrape(base_url, keyword, max_pages, delay, log):
     pages_label = "ALL" if max_pages == 9999 else str(max_pages)
     log(f"🚀 Starting Playwright scrape: **{base_url}** | keyword: `{keyword}` | pages: {pages_label}")
+    log(f"🔍 Chromium path: `{CHROMIUM_EXECUTABLE or 'auto-detect'}`")
     log("---")
 
     products = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # Pass executable_path directly — bypasses all env-var resolution at runtime
+        launch_kwargs: dict = {"headless": True}
+        if CHROMIUM_EXECUTABLE:
+            launch_kwargs["executable_path"] = CHROMIUM_EXECUTABLE
+
+        browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent=random.choice(USER_AGENTS),
             java_script_enabled=True,
             bypass_csp=True,
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
         )
         page = context.new_page()
 
@@ -534,7 +593,7 @@ with st.sidebar:
 
     delay_min, delay_max = st.slider(
         "Delay between requests (seconds)", 1, 10, (2, 4),
-        help="Wait time allows Javascript to render the page fully."
+        help="Wait time allows Javascript to render the page fully.",
     )
 
     st.divider()
@@ -549,16 +608,21 @@ with st.sidebar:
          "description","published_at","updated_at","source_method"],
         default=["model_id","sku","title","brand","audience","department",
                  "min_price","currency","product_url",
-                 "image_url_1","all_image_urls","variant_count","description"]
+                 "image_url_1","all_image_urls","variant_count","description"],
     )
 
     st.divider()
     run_btn = st.button("▶️ Start Scraping", type="primary", use_container_width=True)
 
-# expose to main block
 _all_pages = all_pages
 
 # ── Main area ─────────────────────────────────────────────────────────────────
+
+# Show browser status banner before anything else
+if CHROMIUM_EXECUTABLE:
+    st.success(f"✅ Browser ready: `{CHROMIUM_EXECUTABLE}`")
+else:
+    st.warning("⚠️ Chromium path not resolved — launch may fail. Check logs.")
 
 if run_btn:
     if not keyword.strip():
@@ -585,8 +649,8 @@ if run_btn:
         log_box.markdown(
             '<div style="background:#0e1117;padding:12px;border-radius:8px;'
             'font-family:monospace;font-size:12px;max-height:300px;overflow-y:auto;">'
-            + "<br>".join(log_messages[-40:]) +
-            "</div>",
+            + "<br>".join(log_messages[-40:])
+            + "</div>",
             unsafe_allow_html=True,
         )
 
@@ -602,49 +666,42 @@ if run_btn:
         st.info("Ensure Playwright is installed locally: `playwright install chromium`")
         st.stop()
 
-    # Filter to selected columns
     df = pd.DataFrame(products)
     cols_present = [c for c in export_cols if c in df.columns]
     df_display = df[cols_present] if cols_present else df
 
     st.success(f"✅ Scraped **{len(products)}** products via `{products[0].get('source_method','?')}`")
 
-    # ── Stats row
-    pages_actually_scraped = max(
-        int(len(products) / 24) + (1 if len(products) % 24 else 0), 1
-    )
+    pages_actually_scraped = max(int(len(products) / 24) + (1 if len(products) % 24 else 0), 1)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Products", len(products))
     c2.metric("Pages scraped", pages_actually_scraped)
-    prices = [p["min_price"] for p in products if p.get("min_price") not in ("", "", None)]
+    prices = [p["min_price"] for p in products if p.get("min_price") not in ("", None)]
     c3.metric("Avg price (€)", f"{sum(float(x) for x in prices)/len(prices):.2f}" if prices else "—")
-    brands = {p.get("brand","") for p in products if p.get("brand")}
+    brands = {p.get("brand", "") for p in products if p.get("brand")}
     c4.metric("Unique brands", len(brands))
 
     st.divider()
 
-    # ── Image preview
     with st.expander("🖼️  Image preview (first 12 products)", expanded=False):
         img_cols = st.columns(4)
         shown = 0
         for p in products:
-            url = p.get("image_url_1","")
+            url = p.get("image_url_1", "")
             if url and shown < 12:
                 with img_cols[shown % 4]:
                     try:
-                        st.image(url, caption=p.get("title","")[:40], use_container_width=True)
+                        st.image(url, caption=p.get("title", "")[:40], use_container_width=True)
                     except Exception:
-                        st.write(p.get("title",""))
+                        st.write(p.get("title", ""))
                 shown += 1
 
-    # ── Data table
     st.subheader("📋 Results")
     st.dataframe(df_display, use_container_width=True, height=400)
 
-    # ── Downloads
     st.subheader("⬇️  Export")
     d1, d2, d3 = st.columns(3)
-    fname = f"decathlon_{keyword.replace(' ','_')}"
+    fname = f"decathlon_{keyword.replace(' ', '_')}"
     with d1:
         st.download_button("📄 Download CSV", to_csv(df_display),
                            f"{fname}.csv", "text/csv", use_container_width=True)

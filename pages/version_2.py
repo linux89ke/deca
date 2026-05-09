@@ -1,22 +1,67 @@
 from __future__ import annotations
 
+import glob
 import io
 import json
+import os
 import random
 import re
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 from urllib.parse import urljoin, quote
+
+# ── Playwright browser path MUST be set before importing playwright ───────────
+_PW_HOME = "/tmp/pw-browsers"
+os.makedirs(_PW_HOME, exist_ok=True)
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _PW_HOME
 
 import cloudscraper
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 # ═══════════════════════════════════════════════════════════
-# 1. CONFIGURATION
+# 1. PLAYWRIGHT BROWSER MANAGER
+# ═══════════════════════════════════════════════════════════
+
+@st.cache_resource(show_spinner="⏳ Installing Chromium (one-time)…")
+def _install_browser() -> Optional[str]:
+    pw_env = {**os.environ, "PLAYWRIGHT_BROWSERS_PATH": _PW_HOME}
+    # Try with system deps first, fall back to plain install
+    for extra in [["--with-deps"], []]:
+        try:
+            r = subprocess.run(
+                [sys.executable, "-m", "playwright", "install"] + extra + ["chromium"],
+                env=pw_env, capture_output=True, text=True, timeout=300,
+            )
+            if r.returncode == 0:
+                break
+        except Exception:
+            pass
+    # Locate the binary
+    for pattern in [f"{_PW_HOME}/**/chrome-headless-shell",
+                    f"{_PW_HOME}/**/chromium",
+                    f"{_PW_HOME}/**/chrome"]:
+        hits = [h for h in glob.glob(pattern, recursive=True)
+                if os.path.isfile(h) and os.access(h, os.X_OK)]
+        if hits:
+            return hits[0]
+    return None
+
+CHROMIUM_EXEC: Optional[str] = _install_browser()
+
+CHROMIUM_ARGS = [
+    "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+    "--single-process", "--no-zygote", "--disable-setuid-sandbox",
+]
+
+# ═══════════════════════════════════════════════════════════
+# 2. CONFIGURATION
 # ═══════════════════════════════════════════════════════════
 
 COUNTRIES = {
@@ -44,7 +89,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 
 ALL_EXPORT_COLUMNS = [
@@ -63,73 +107,23 @@ DEFAULT_EXPORT_COLUMNS = [
 ]
 
 HTML_SELECTORS = [
-    "div[data-testid='product-card']",
-    "article.vtmn-card",
-    "div.vtmn-card",
-    "div[class*='product-card']",
-    "div[class*='ProductCard']",
-    "li[class*='product']",
-    "li.ais-Hits-item",
-    "div[class*='product-block']",
-    "div.dpb-models",
-    "a.product-link",
+    "div[data-testid='product-card']", "article.vtmn-card", "div.vtmn-card",
+    "div[class*='product-card']", "div[class*='ProductCard']",
+    "li[class*='product']", "li.ais-Hits-item",
+    "div[class*='product-block']", "div.dpb-models", "a.product-link",
 ]
-
-# ═══════════════════════════════════════════════════════════
-# 2. HTTP SESSION
-# ═══════════════════════════════════════════════════════════
-
-def create_session():
-    session = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False},
-    )
-    session.headers.update({
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "DNT":             "1",
-        "Connection":      "keep-alive",
-        "User-Agent":      random.choice(USER_AGENTS),
-    })
-    return session
-
-
-def fetch(session, url, retries=3, delay=(1, 3), log=print):
-    for attempt in range(1, retries + 1):
-        try:
-            resp = session.get(url, timeout=20, allow_redirects=True)
-            if resp.status_code == 200:
-                return resp
-            log(f"  ⚠️ HTTP {resp.status_code} (attempt {attempt}/{retries})")
-        except Exception as exc:
-            log(f"  ⚠️ Request error (attempt {attempt}/{retries}): {str(exc)[:80]}")
-        if attempt < retries:
-            t = random.uniform(*delay)
-            log(f"  ⏱ Retrying in {t:.1f}s…")
-            time.sleep(t)
-    log(f"  ❌ All {retries} attempts failed: {url}")
-    return None
-
 
 # ═══════════════════════════════════════════════════════════
 # 3. DATA PROCESSOR
 # ═══════════════════════════════════════════════════════════
 
 _AUDIENCE_RULES = [
-    ("Kids", [
-        r"\benfant[s]?\b", r"\bjunior[s]?\b", r"\bkid[s]?\b", r"\bchild(ren)?\b",
-        r"\bgamin[s]?\b", r"\bfille[s]?\b", r"\bgar[çc]on[s]?\b",
-        r"\bboy[s]?\b", r"\bgirl[s]?\b", r"\b\d+[-\s]?\d*\s*ans\b",
-        r"\byouth\b", r"\bbaby\b", r"\bbébé\b",
-    ]),
-    ("Women", [
-        r"\bfemme[s]?\b", r"\bwoman\b", r"\bwomen\b", r"\bféminin\b",
-        r"\bwomens\b", r"\bladies\b", r"\bdame[s]?\b",
-    ]),
-    ("Men", [
-        r"\bhomme[s]?\b", r"\bman\b", r"\bmen\b", r"\bmasculin\b",
-        r"\bmens\b", r"\bgentlemen\b",
-    ]),
+    ("Kids",  [r"\benfant[s]?\b", r"\bjunior[s]?\b", r"\bkid[s]?\b", r"\bchild(ren)?\b",
+               r"\bgamin[s]?\b", r"\bfille[s]?\b", r"\bgar[çc]on[s]?\b",
+               r"\bboy[s]?\b", r"\bgirl[s]?\b", r"\byouth\b", r"\bbaby\b"]),
+    ("Women", [r"\bfemme[s]?\b", r"\bwoman\b", r"\bwomen\b", r"\bféminin\b",
+               r"\bwomens\b", r"\bladies\b", r"\bdame[s]?\b"]),
+    ("Men",   [r"\bhomme[s]?\b", r"\bman\b", r"\bmen\b", r"\bmasculin\b", r"\bmens\b"]),
 ]
 
 _DEPARTMENT_RULES = [
@@ -148,12 +142,10 @@ _DEPARTMENT_RULES = [
     ("Rugby",        [r"\brugby\b"]),
     ("Volleyball",   [r"\bvolleyball\b", r"\bvolley\b"]),
     ("Golf",         [r"\bgolf\b"]),
-    ("Equestrian",   [r"\béquitation\b", r"\bhorse\b", r"\briding\b"]),
-    ("Clothing",     [r"\bvêtement[s]?\b", r"\btee.shirt\b", r"\bjacket\b", r"\blegging[s]?\b"]),
+    ("Clothing",     [r"\bvêtement[s]?\b", r"\bjacket\b", r"\blegging[s]?\b", r"\bshort[s]?\b"]),
     ("Footwear",     [r"\bchaussure[s]?\b", r"\bshoe[s]?\b", r"\bsneaker[s]?\b", r"\bboot[s]?\b"]),
-    ("Accessories",  [r"\baccessoire[s]?\b", r"\bsac[s]?\b", r"\bbag[s]?\b", r"\bgant[s]?\b"]),
+    ("Accessories",  [r"\baccessoire[s]?\b", r"\bsac[s]?\b", r"\bbag[s]?\b"]),
 ]
-
 
 def _first_match(blob, rules):
     blob = blob.lower()
@@ -162,11 +154,9 @@ def _first_match(blob, rules):
             return label
     return ""
 
-
 def classify(title="", tags="", product_type="", description="", handle=""):
     blob = " ".join([title, tags, product_type, handle, description])
     return _first_match(blob, _AUDIENCE_RULES), _first_match(blob, _DEPARTMENT_RULES)
-
 
 def extract_ids(handle="", sku="", tags="", product_id=None):
     model_id = ""
@@ -186,7 +176,6 @@ def extract_ids(handle="", sku="", tags="", product_id=None):
         model_id = str(product_id)
     return model_id, sku or ""
 
-
 def parse_price(raw):
     if raw is None or raw == "":
         return ""
@@ -195,7 +184,6 @@ def parse_price(raw):
         return float(cleaned) if cleaned else ""
     except Exception:
         return ""
-
 
 def deduplicate(products):
     seen, out = set(), []
@@ -206,7 +194,6 @@ def deduplicate(products):
         seen.add(key)
         out.append(p)
     return out
-
 
 # ═══════════════════════════════════════════════════════════
 # 4. PARSERS
@@ -222,15 +209,11 @@ def _img_fields(urls):
         "all_image_urls": " | ".join(clean),
     }
 
-
 def parse_shopify(p, base_url):
     raw_v = p.get("variants", [])
-    variants = [
-        {"variant_id": v.get("id"), "title": v.get("title"), "sku": v.get("sku"),
-         "price": v.get("price"), "compare_at": v.get("compare_at_price"),
-         "available": v.get("available"), "option1": v.get("option1"), "option2": v.get("option2")}
-        for v in raw_v
-    ]
+    variants = [{"variant_id": v.get("id"), "title": v.get("title"), "sku": v.get("sku"),
+                 "price": v.get("price"), "available": v.get("available"),
+                 "option1": v.get("option1"), "option2": v.get("option2")} for v in raw_v]
     avail_prices = [float(v["price"]) for v in raw_v if v.get("available") and v.get("price")]
     handle    = p.get("handle", "")
     tags_str  = ", ".join(p.get("tags", []))
@@ -242,29 +225,17 @@ def parse_shopify(p, base_url):
     audience, department  = classify(title=p.get("title", ""), tags=tags_str,
                                      product_type=p.get("product_type", ""), description=desc, handle=handle)
     return {
-        "product_id":    p.get("id"),
-        "model_id":      model_id,
-        "sku":           article_sku,
-        "all_skus":      " | ".join(all_skus),
-        "title":         p.get("title", ""),
-        "brand":         p.get("vendor", ""),
-        "audience":      audience,
-        "department":    department,
-        "product_type":  p.get("product_type", ""),
-        "tags":          tags_str,
-        "product_url":   f"{base_url}/products/{handle}" if handle else "",
-        "min_price":     min(avail_prices) if avail_prices else "",
-        "currency":      "EUR",
-        **_img_fields(images),
-        "variant_count": len(variants),
-        "option_names":  ", ".join(o.get("name", "") for o in p.get("options", [])),
-        "variants_json": json.dumps(variants, ensure_ascii=False),
-        "description":   desc[:600],
-        "published_at":  p.get("published_at", ""),
-        "updated_at":    p.get("updated_at", ""),
+        "product_id": p.get("id"), "model_id": model_id, "sku": article_sku,
+        "all_skus": " | ".join(all_skus), "title": p.get("title", ""), "brand": p.get("vendor", ""),
+        "audience": audience, "department": department, "product_type": p.get("product_type", ""),
+        "tags": tags_str, "product_url": f"{base_url}/products/{handle}" if handle else "",
+        "min_price": min(avail_prices) if avail_prices else "", "currency": "EUR",
+        **_img_fields(images), "variant_count": len(variants),
+        "option_names": ", ".join(o.get("name", "") for o in p.get("options", [])),
+        "variants_json": json.dumps(variants, ensure_ascii=False), "description": desc[:600],
+        "published_at": p.get("published_at", ""), "updated_at": p.get("updated_at", ""),
         "source_method": "shopify-json",
     }
-
 
 def parse_next(p, base_url):
     def g(*keys):
@@ -273,91 +244,31 @@ def parse_next(p, base_url):
                 return p[k]
         return ""
     imgs = p.get("images", p.get("media", []))
-    image_urls = [
-        (img.get("url") or img.get("src") or img.get("href") or "") if isinstance(img, dict) else str(img)
-        for img in (imgs if isinstance(imgs, list) else [])
-    ]
+    image_urls = [(img.get("url") or img.get("src") or "") if isinstance(img, dict) else str(img)
+                  for img in (imgs if isinstance(imgs, list) else [])]
     price = parse_price(g("price", "salePrice", "currentPrice", "priceMin"))
     slug  = str(g("url", "href", "productUrl", "slug"))
-    model_id, article_sku = extract_ids(
-        handle=slug, sku=str(g("sku", "articleCode", "articleId", "skuId")),
-        tags=str(g("tags", "")), product_id=str(g("id", "modelId", "productId", "modelRef")),
-    )
-    audience, department = classify(
-        title=str(g("title", "name", "label", "productLabel")),
-        tags=str(g("tags", "")), product_type=str(g("category", "productType", "type")),
-        description=str(g("description", "shortDescription", "subtitle")), handle=slug,
-    )
+    model_id, article_sku = extract_ids(handle=slug, sku=str(g("sku", "articleCode")),
+                                        tags=str(g("tags", "")),
+                                        product_id=str(g("id", "modelId", "productId", "modelRef")))
+    audience, department = classify(title=str(g("title", "name", "label", "productLabel")),
+                                    tags=str(g("tags", "")),
+                                    product_type=str(g("category", "productType", "type")),
+                                    description=str(g("description", "shortDescription")), handle=slug)
     return {
-        "product_id":    g("id", "modelId", "productId", "modelRef"),
-        "model_id":      model_id,
-        "sku":           article_sku,
-        "all_skus":      "",
-        "title":         g("title", "name", "label", "productLabel"),
-        "brand":         g("brand", "brandLabel", "vendor", "maker"),
-        "audience":      audience,
-        "department":    department,
-        "product_type":  g("category", "productType", "type"),
-        "tags":          "",
-        "product_url":   urljoin(base_url, slug) if slug else "",
-        "min_price":     price,
-        "currency":      g("currency", "currencyCode") or "EUR",
+        "product_id": g("id", "modelId", "productId", "modelRef"), "model_id": model_id,
+        "sku": article_sku, "all_skus": "", "title": g("title", "name", "label", "productLabel"),
+        "brand": g("brand", "brandLabel", "vendor", "maker"), "audience": audience,
+        "department": department, "product_type": g("category", "productType", "type"),
+        "tags": "", "product_url": urljoin(base_url, slug) if slug else "",
+        "min_price": price, "currency": g("currency", "currencyCode") or "EUR",
         **_img_fields(image_urls or [str(g("image", "thumbnail", "imgUrl"))]),
-        "variant_count": len(p.get("variants", p.get("sizes", []))),
-        "option_names":  "",
+        "variant_count": len(p.get("variants", p.get("sizes", []))), "option_names": "",
         "variants_json": json.dumps(p.get("variants", []), ensure_ascii=False),
-        "description":   str(g("description", "shortDescription", "subtitle"))[:600],
-        "published_at":  g("publishedAt", "createdAt"),
-        "updated_at":    g("updatedAt", "modifiedAt"),
+        "description": str(g("description", "shortDescription", "subtitle"))[:600],
+        "published_at": g("publishedAt", "createdAt"), "updated_at": g("updatedAt", "modifiedAt"),
         "source_method": "next-data",
     }
-
-
-def parse_algolia_hit(hit, base_url):
-    def g(*keys):
-        for k in keys:
-            if k in hit and hit[k] not in (None, ""):
-                return hit[k]
-        return ""
-    imgs = hit.get("images", hit.get("media", []))
-    image_urls = [
-        (img.get("url") or img.get("src") or "") if isinstance(img, dict) else str(img)
-        for img in (imgs if isinstance(imgs, list) else [])
-    ]
-    if not image_urls and g("image"):
-        image_urls = [str(g("image"))]
-    slug  = str(g("url", "productUrl", "slug", "objectID"))
-    price = parse_price(g("price", "salePrice", "offer_price", "priceMin"))
-    model_id, article_sku = extract_ids(
-        handle=slug, sku=str(g("sku", "articleCode", "skuId")),
-        tags=str(g("tags", "")), product_id=str(g("objectID", "id", "modelId")),
-    )
-    audience, department = classify(title=str(g("title", "name", "label")),
-                                    tags=str(g("tags", "category", "")), handle=slug)
-    return {
-        "product_id":    g("objectID", "id", "modelId"),
-        "model_id":      model_id,
-        "sku":           article_sku,
-        "all_skus":      "",
-        "title":         g("title", "name", "label"),
-        "brand":         g("brand", "brandLabel", "vendor"),
-        "audience":      audience,
-        "department":    department,
-        "product_type":  g("category", "productType", "type"),
-        "tags":          str(g("tags", "")),
-        "product_url":   urljoin(base_url, slug) if slug else "",
-        "min_price":     price,
-        "currency":      g("currency") or "EUR",
-        **_img_fields(image_urls),
-        "variant_count": "",
-        "option_names":  "",
-        "variants_json": "[]",
-        "description":   str(g("description", "shortDescription", "subtitle"))[:600],
-        "published_at":  "",
-        "updated_at":    "",
-        "source_method": "algolia",
-    }
-
 
 def parse_html(card, base_url):
     def t(*sels):
@@ -375,84 +286,30 @@ def parse_html(card, base_url):
         if src:
             if src.startswith("//"):
                 src = "https:" + src
-            if src.startswith("http") and ("decathlon" in src or "content" in src):
+            if src.startswith("http"):
                 image_urls.append(src)
     price_raw = t("[data-testid='price']", "span.vtmn-price", "[class*='price']",
-                  "span[class*='Price']", "div[class*='price']", "span[class*='amount']")
+                  "span[class*='Price']", "div[class*='price']")
     title_val = t("[data-testid='product-card-name']", "p.vtmn-card_title",
                   "[class*='product-name']", "[class*='ProductName']", "h2", "h3", "p")
-    brand_val = t("[data-testid='product-card-brand']", "[class*='brand']", "span[class*='Brand']")
+    brand_val = t("[data-testid='product-card-brand']", "[class*='brand']")
     raw_sku   = card.get("data-sku") or card.get("data-article-code") or ""
-    raw_model = (card.get("data-model-id") or card.get("data-model")
-                 or card.get("data-id") or card.get("data-product-id") or "")
+    raw_model = card.get("data-model-id") or card.get("data-id") or card.get("data-product-id") or ""
     model_id, article_sku = extract_ids(handle=product_url, sku=raw_sku, product_id=raw_model)
     audience, department  = classify(title=title_val, handle=product_url)
     return {
-        "product_id":    raw_model,
-        "model_id":      model_id,
-        "sku":           article_sku,
-        "all_skus":      "",
-        "title":         title_val,
-        "brand":         brand_val,
-        "audience":      audience,
-        "department":    department,
-        "product_type":  "",
-        "tags":          "",
-        "product_url":   product_url,
-        "min_price":     parse_price(price_raw),
-        "currency":      "EUR",
-        **_img_fields(image_urls),
-        "variant_count": "",
-        "option_names":  "",
-        "variants_json": "[]",
-        "description":   t("[class*='description']", "[class*='subtitle']"),
-        "published_at":  "",
-        "updated_at":    "",
-        "source_method": "html-bs4",
+        "product_id": raw_model, "model_id": model_id, "sku": article_sku, "all_skus": "",
+        "title": title_val, "brand": brand_val, "audience": audience, "department": department,
+        "product_type": "", "tags": "", "product_url": product_url,
+        "min_price": parse_price(price_raw), "currency": "EUR",
+        **_img_fields(image_urls), "variant_count": "", "option_names": "", "variants_json": "[]",
+        "description": t("[class*='description']", "[class*='subtitle']"),
+        "published_at": "", "updated_at": "", "source_method": "html-bs4",
     }
 
-
 # ═══════════════════════════════════════════════════════════
-# 5. SCRAPING STRATEGIES
+# 5. SHARED HELPERS
 # ═══════════════════════════════════════════════════════════
-
-@dataclass
-class ScrapeConfig:
-    base_url:  str
-    keyword:   str
-    max_pages: int      = 5
-    delay:     tuple    = (1, 3)
-    retries:   int      = 2
-    log:       Callable = field(default=print, repr=False)
-
-
-def strategy_shopify(session, cfg):
-    products = []
-    cfg.log("### Strategy 1 — Shopify /products.json")
-    for page_num in range(1, cfg.max_pages + 1):
-        url = f"{cfg.base_url}/products.json?q={quote(cfg.keyword)}&limit=24&page={page_num}"
-        cfg.log(f"  📦 Page {page_num} → {url}")
-        resp = fetch(session, url, retries=cfg.retries, delay=cfg.delay, log=cfg.log)
-        if resp is None:
-            return None
-        try:
-            data = resp.json()
-        except Exception:
-            cfg.log("  ❌ Not JSON — not a Shopify site.")
-            return None
-        if "products" not in data:
-            cfg.log("  ❌ No products key — not a Shopify site.")
-            return None
-        page_prods = data["products"]
-        if not page_prods:
-            cfg.log(f"  ✅ No more products at page {page_num}.")
-            break
-        for p in page_prods:
-            products.append(parse_shopify(p, cfg.base_url))
-        cfg.log(f"  ✅ +{len(page_prods)} products (total: {len(products)})")
-        time.sleep(random.uniform(*cfg.delay))
-    return products if products else None
-
 
 def _walk_for_products(data, depth=0):
     results = []
@@ -468,7 +325,6 @@ def _walk_for_products(data, depth=0):
         for v in data.values():
             results.extend(_walk_for_products(v, depth + 1))
     return results
-
 
 def _extract_next_data(html, base_url, log):
     m = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.DOTALL)
@@ -486,73 +342,101 @@ def _extract_next_data(html, base_url, log):
         log(f"  ⚠️ __NEXT_DATA__ parse error: {exc}")
         return None
 
-
-def _find_algolia_creds(html, log):
-    patterns = {
-        "app_id":  [r'"algoliaAppId"\s*:\s*"([^"]+)"', r'"applicationID"\s*:\s*"([^"]+)"',
-                    r'ALGOLIA_APP_ID["\s:=]+([A-Z0-9]{8,12})', r'"appId"\s*:\s*"([A-Z0-9]{8,12})"'],
-        "api_key": [r'"algoliaApiKey"\s*:\s*"([^"]+)"', r'"apiKey"\s*:\s*"([a-f0-9]{20,40})"',
-                    r'"searchApiKey"\s*:\s*"([^"]+)"', r'ALGOLIA_API_KEY["\s:=]+([a-f0-9]{20,40})'],
-        "index":   [r'"algoliaIndexName"\s*:\s*"([^"]+)"', r'"indexName"\s*:\s*"([^"]+)"',
-                    r'(decathlon_[a-z_]+_products[a-z_]*)'],
-    }
-    results = {}
-    for key, pats in patterns.items():
-        for pat in pats:
-            m = re.search(pat, html, re.IGNORECASE)
-            if m:
-                results[key] = m.group(1) if m.lastindex else m.group(0)
-                break
-    if all(k in results for k in ("app_id", "api_key", "index")):
-        log(f"  ✅ Algolia found — app: {results['app_id']}, index: {results['index']}")
-        return results["app_id"], results["api_key"], results["index"]
-    log("  ℹ️ No Algolia credentials found.")
+def _parse_html_cards(html, base_url, log):
+    soup = BeautifulSoup(html, "lxml")
+    for sel in HTML_SELECTORS:
+        cards = soup.select(sel)
+        if cards:
+            log(f"  ✅ Selector '{sel}': {len(cards)} cards")
+            return [parse_html(c, base_url) for c in cards]
     return None
 
+# ═══════════════════════════════════════════════════════════
+# 6. SCRAPE CONFIG
+# ═══════════════════════════════════════════════════════════
 
-def strategy_algolia(session, cfg, app_id, api_key, index_name):
-    cfg.log(f"### Strategy 2 — Algolia API ({index_name})")
-    products = []
-    url = f"https://{app_id}-dsn.algolia.net/1/indexes/{index_name}/query"
-    headers = {"X-Algolia-Application-Id": app_id, "X-Algolia-API-Key": api_key,
-               "Content-Type": "application/json"}
-    for page_num in range(cfg.max_pages):
-        payload = {"query": cfg.keyword, "hitsPerPage": 48, "page": page_num, "attributesToRetrieve": "*"}
-        cfg.log(f"  🔎 Algolia page {page_num + 1}")
+@dataclass
+class ScrapeConfig:
+    base_url:  str
+    keyword:   str
+    max_pages: int      = 5
+    delay:     tuple    = (1, 3)
+    retries:   int      = 2
+    log:       Callable = field(default=print, repr=False)
+
+# ═══════════════════════════════════════════════════════════
+# 7. CLOUDSCRAPER STRATEGIES (primary, no browser)
+# ═══════════════════════════════════════════════════════════
+
+def create_session():
+    session = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False},
+    )
+    session.headers.update({
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "DNT": "1", "Connection": "keep-alive",
+        "User-Agent": random.choice(USER_AGENTS),
+    })
+    return session
+
+def cs_fetch(session, url, retries=3, delay=(1, 3), log=print):
+    for attempt in range(1, retries + 1):
         try:
-            resp = session.post(url, headers=headers, json=payload, timeout=15)
-            data = resp.json()
-            hits = data.get("hits", [])
-            if not hits:
-                cfg.log("  ✅ No more hits.")
-                break
-            for hit in hits:
-                products.append(parse_algolia_hit(hit, cfg.base_url))
-            cfg.log(f"  ✅ +{len(hits)} hits (total: {len(products)})")
-            if page_num + 1 >= data.get("nbPages", 1):
-                break
-            time.sleep(random.uniform(*cfg.delay))
+            resp = session.get(url, timeout=20, allow_redirects=True)
+            if resp.status_code == 200:
+                return resp
+            log(f"  ⚠️ HTTP {resp.status_code} (attempt {attempt}/{retries})")
         except Exception as exc:
-            cfg.log(f"  ❌ Algolia error: {exc}")
+            log(f"  ⚠️ Error (attempt {attempt}/{retries}): {str(exc)[:80]}")
+        if attempt < retries:
+            t = random.uniform(*delay)
+            time.sleep(t)
+    return None
+
+def cs_shopify(session, cfg):
+    products = []
+    cfg.log("### Strategy 1 — Shopify /products.json")
+    for page_num in range(1, cfg.max_pages + 1):
+        url = f"{cfg.base_url}/products.json?q={quote(cfg.keyword)}&limit=24&page={page_num}"
+        cfg.log(f"  📦 Page {page_num} → {url}")
+        resp = cs_fetch(session, url, retries=cfg.retries, delay=cfg.delay, log=cfg.log)
+        if resp is None:
+            return None
+        try:
+            data = resp.json()
+        except Exception:
+            cfg.log("  ❌ Not JSON — not Shopify.")
+            return None
+        if "products" not in data:
+            cfg.log("  ❌ No products key.")
+            return None
+        page_prods = data["products"]
+        if not page_prods:
+            cfg.log(f"  ✅ No more products at page {page_num}.")
             break
+        for p in page_prods:
+            products.append(parse_shopify(p, cfg.base_url))
+        cfg.log(f"  ✅ +{len(page_prods)} (total: {len(products)})")
+        time.sleep(random.uniform(*cfg.delay))
     return products if products else None
 
-
-def strategy_html(session, cfg):
-    cfg.log("### Strategy 3 — HTML / BeautifulSoup")
+def cs_html(session, cfg):
+    cfg.log("### Strategy 2 — Cloudscraper + HTML")
     products = []
     templates = [
         f"{cfg.base_url}/search?query={quote(cfg.keyword)}&page={{p}}",
         f"{cfg.base_url}/search?Ntt={quote(cfg.keyword)}&page={{p}}",
-        f"{cfg.base_url}/catalogsearch/result/?q={quote(cfg.keyword)}&p={{p}}",
         f"{cfg.base_url}/search?q={quote(cfg.keyword)}&page={{p}}",
+        f"{cfg.base_url}/catalogsearch/result/?q={quote(cfg.keyword)}&p={{p}}",
     ]
     for page_num in range(1, cfg.max_pages + 1):
         resp = None
         for tmpl in templates:
             url = tmpl.format(p=page_num)
             cfg.log(f"  🔍 Page {page_num} → {url}")
-            resp = fetch(session, url, retries=cfg.retries, delay=cfg.delay, log=cfg.log)
+            resp = cs_fetch(session, url, retries=cfg.retries, delay=cfg.delay, log=cfg.log)
             if resp:
                 break
         if not resp:
@@ -561,59 +445,158 @@ def strategy_html(session, cfg):
         html = resp.text
         page_prods = _extract_next_data(html, cfg.base_url, cfg.log)
         if not page_prods:
-            cfg.log("  🔧 Falling back to HTML card parsing…")
-            soup = BeautifulSoup(html, "lxml")
-            for sel in HTML_SELECTORS:
-                cards = soup.select(sel)
-                if cards:
-                    cfg.log(f"  ✅ Selector '{sel}': {len(cards)} cards")
-                    page_prods = [parse_html(c, cfg.base_url) for c in cards]
-                    break
+            cfg.log("  🔧 Trying HTML card parsing…")
+            page_prods = _parse_html_cards(html, cfg.base_url, cfg.log)
         if not page_prods:
-            cfg.log("  ⛔ No products found — stopping.")
+            cfg.log("  ⛔ No products — stopping.")
             break
         products.extend(page_prods)
         cfg.log(f"  📊 Running total: {len(products)} products")
         time.sleep(random.uniform(*cfg.delay))
     return products
 
+# ═══════════════════════════════════════════════════════════
+# 8. PLAYWRIGHT STRATEGY (fallback, for JS-heavy SPAs)
+# ═══════════════════════════════════════════════════════════
 
-def run_scrape(cfg):
+def _slow_scroll(page):
+    for frac in (0.25, 0.5, 0.75, 1.0):
+        page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {frac})")
+        time.sleep(0.7)
+
+def pw_scrape(cfg: ScrapeConfig) -> list:
+    cfg.log("### Playwright Fallback — headless browser")
+
+    if not CHROMIUM_EXEC:
+        cfg.log("  ❌ Chromium binary not found. Add packages.txt to your repo.")
+        return []
+
+    cfg.log(f"  🖥 Binary: {CHROMIUM_EXEC}")
+    products = []
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                executable_path=CHROMIUM_EXEC,
+                args=CHROMIUM_ARGS,
+            )
+            ctx = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent=random.choice(USER_AGENTS),
+                java_script_enabled=True,
+                bypass_csp=True,
+                ignore_https_errors=True,
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
+            ctx.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = { runtime: {} };
+            """)
+            page = ctx.new_page()
+
+            # Try Shopify JSON first (even in browser context)
+            for page_num in range(1, cfg.max_pages + 1):
+                url = f"{cfg.base_url}/products.json?q={quote(cfg.keyword)}&limit=24&page={page_num}"
+                cfg.log(f"  📦 [PW-Shopify] Page {page_num} → {url}")
+                try:
+                    resp = page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                    time.sleep(1)
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        data = json.loads(page.locator("body").inner_text())
+                    page_prods = data.get("products", [])
+                    if not page_prods:
+                        break
+                    for p in page_prods:
+                        products.append(parse_shopify(p, cfg.base_url))
+                    cfg.log(f"  ✅ +{len(page_prods)} (total: {len(products)})")
+                    if page_prods:
+                        continue
+                except Exception:
+                    cfg.log("  ℹ️ Not Shopify — switching to search pages.")
+                    products = []
+                    break
+
+            # If Shopify didn't work, scrape search pages
+            if not products:
+                templates = [
+                    f"{cfg.base_url}/search?query={quote(cfg.keyword)}&page={{p}}",
+                    f"{cfg.base_url}/search?Ntt={quote(cfg.keyword)}&page={{p}}",
+                    f"{cfg.base_url}/search?q={quote(cfg.keyword)}&page={{p}}",
+                ]
+                for page_num in range(1, cfg.max_pages + 1):
+                    fetched = False
+                    for tmpl in templates:
+                        url = tmpl.format(p=page_num)
+                        cfg.log(f"  🔍 [PW] Page {page_num} → {url}")
+                        try:
+                            page.goto(url, wait_until="domcontentloaded", timeout=40000)
+                            fetched = True
+                            break
+                        except Exception as e:
+                            cfg.log(f"  ⚠️ Nav failed: {str(e)[:60]}")
+                    if not fetched:
+                        break
+
+                    wait_s = random.uniform(*cfg.delay)
+                    cfg.log(f"  ⏱ Waiting {wait_s:.1f}s for JS render…")
+                    time.sleep(wait_s)
+                    _slow_scroll(page)
+
+                    html = page.content()
+                    page_prods = _extract_next_data(html, cfg.base_url, cfg.log)
+                    if not page_prods:
+                        cfg.log("  🔧 Trying HTML card parsing…")
+                        page_prods = _parse_html_cards(html, cfg.base_url, cfg.log)
+                    if not page_prods:
+                        cfg.log("  ⛔ No products — stopping.")
+                        break
+                    products.extend(page_prods)
+                    cfg.log(f"  📊 Running total: {len(products)} products")
+                    time.sleep(random.uniform(*cfg.delay))
+
+            browser.close()
+    except Exception as exc:
+        cfg.log(f"  ❌ Playwright error: {exc}")
+
+    return products
+
+# ═══════════════════════════════════════════════════════════
+# 9. MAIN ORCHESTRATOR
+# ═══════════════════════════════════════════════════════════
+
+def run_scrape(cfg: ScrapeConfig) -> list:
     pages_label = "ALL" if cfg.max_pages == 9999 else str(cfg.max_pages)
-    cfg.log(f"🚀 **{cfg.base_url}** | keyword: `{cfg.keyword}` | max pages: {pages_label}")
+    cfg.log(f"🚀 **{cfg.base_url}** | keyword: `{cfg.keyword}` | pages: {pages_label}")
     cfg.log("---")
+
     session  = create_session()
     products = []
 
-    result = strategy_shopify(session, cfg)
+    # Strategy 1: Shopify (cloudscraper)
+    result = cs_shopify(session, cfg)
     if result:
         products = result
-        cfg.log(f"✅ Shopify strategy: {len(products)} products.")
+        cfg.log(f"✅ Shopify: {len(products)} products.")
     else:
-        cfg.log("⚠️ Strategy 1 failed. Scanning for Algolia credentials…")
-        resp = fetch(session, f"{cfg.base_url}/search?query={quote(cfg.keyword)}",
-                     retries=2, delay=cfg.delay, log=cfg.log)
-        html = resp.text if resp else ""
-        algolia_creds = _find_algolia_creds(html, cfg.log) if html else None
+        # Strategy 2: HTML (cloudscraper)
+        cfg.log("⚠️ Shopify failed. Trying HTML scraping…")
+        products = cs_html(session, cfg)
 
-        if algolia_creds:
-            result = strategy_algolia(session, cfg, *algolia_creds)
-            if result:
-                products = result
-                cfg.log(f"✅ Algolia strategy: {len(products)} products.")
-
-        if not products:
-            cfg.log("⚠️ Switching to HTML scraping…")
-            cfg.log("---")
-            products = strategy_html(session, cfg)
+    # Strategy 3: Playwright fallback (browser-based)
+    if not products:
+        cfg.log("⚠️ Cloudscraper returned nothing. Launching Playwright browser…")
+        cfg.log("---")
+        products = pw_scrape(cfg)
 
     products = deduplicate(products)
     cfg.log(f"✅ Done. **{len(products)} unique products** collected.")
     return products
 
-
 # ═══════════════════════════════════════════════════════════
-# 6. EXPORT HELPERS
+# 10. EXPORT HELPERS
 # ═══════════════════════════════════════════════════════════
 
 def to_csv(df):
@@ -630,29 +613,35 @@ def to_excel(df):
         df.to_excel(w, index=False, sheet_name="Products")
     return buf.getvalue()
 
-
 # ═══════════════════════════════════════════════════════════
-# 7. STREAMLIT UI
+# 11. STREAMLIT UI
 # ═══════════════════════════════════════════════════════════
 
 st.set_page_config(page_title="Decathlon Scraper", page_icon="🛒", layout="wide")
 
 st.title("🛒 Decathlon Scraper")
-st.caption("Browser-free: Shopify JSON → Algolia API → Next.js data → HTML fallback.")
+st.caption("Shopify JSON → HTML scraping → Playwright browser fallback")
+
+# Browser status
+if CHROMIUM_EXEC:
+    st.success(f"✅ Playwright browser ready: `{CHROMIUM_EXEC}`")
+else:
+    st.warning("⚠️ Playwright browser not found — add `packages.txt` for JS-heavy sites. Cloudscraper will still run.")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
     country_label = st.selectbox("Country / Site", list(COUNTRIES.keys()))
     base_url      = COUNTRIES[country_label]
     st.caption(f"`{base_url}`")
-    keyword = st.text_input("Search keyword", value="vélo")
+    keyword = st.text_input("Search keyword", value="cycle",
+                            help="Use the local language. e.g. 'cycle' for India, 'vélo' for France, 'Fahrrad' for Germany.")
     all_pages_toggle = st.toggle("📄 Scrape ALL pages", value=False)
     if all_pages_toggle:
         st.caption("⚠️ No page limit.")
         max_pages = 9999
     else:
         max_pages = st.slider("Max pages", 1, 100, 5)
-    delay_min, delay_max = st.slider("Delay between requests (s)", 0, 8, (1, 3))
+    delay_min, delay_max = st.slider("Delay between requests (s)", 0, 8, (2, 4))
     retries = st.slider("Retries per request", 1, 4, 2)
     st.divider()
     export_cols = st.multiselect("Export columns", ALL_EXPORT_COLUMNS,
@@ -681,7 +670,7 @@ if run_btn:
             status_box.info(f"⏳ {totals[-1].strip()}")
         log_box.markdown(
             '<div style="background:#0e1117;padding:12px;border-radius:8px;'
-            'font-family:monospace;font-size:12px;max-height:280px;overflow-y:auto;">'
+            'font-family:monospace;font-size:12px;max-height:300px;overflow-y:auto;">'
             + "<br>".join(log_lines[-60:]) + "</div>",
             unsafe_allow_html=True,
         )
@@ -694,7 +683,7 @@ if run_btn:
     status_box.empty()
 
     if not products:
-        st.error("No products found. Check the log above.")
+        st.error("No products found. Try a different keyword or country.")
         st.stop()
 
     df = pd.DataFrame(products)
@@ -704,7 +693,7 @@ if run_btn:
     st.success(f"✅ **{len(products)}** products via `{products[0].get('source_method', '?')}`")
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Products",      len(products))
+    c1.metric("Products", len(products))
     c2.metric("Unique brands", len({p.get("brand", "") for p in products if p.get("brand")}))
     valid_prices = []
     for p in products:
@@ -750,11 +739,9 @@ if run_btn:
     fname = f"decathlon_{keyword.replace(' ', '_')}"
     d1, d2, d3 = st.columns(3)
     with d1:
-        st.download_button("📄 CSV", to_csv(df_show),
-                           f"{fname}.csv", "text/csv", use_container_width=True)
+        st.download_button("📄 CSV", to_csv(df_show), f"{fname}.csv", "text/csv", use_container_width=True)
     with d2:
-        st.download_button("📋 JSON", to_json_bytes(df_show),
-                           f"{fname}.json", "application/json", use_container_width=True)
+        st.download_button("📋 JSON", to_json_bytes(df_show), f"{fname}.json", "application/json", use_container_width=True)
     with d3:
         st.download_button("📊 Excel", to_excel(df_show), f"{fname}.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

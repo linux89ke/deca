@@ -48,7 +48,7 @@ ALL_EXPORT_COLUMNS = (
      "min_price", "original_price", "discount_pct", "currency",
      "rating", "review_count", "image_count"]
     + [f"image_url_{i}" for i in range(1, MAX_IMAGES + 1)]
-    + ["all_image_urls", "description_short", "description_long", "source_method"]
+    + ["all_image_urls", "description", "source_method"]
 )
 
 # ═══════════════════════════════════════════════════════════
@@ -74,6 +74,8 @@ _BRANDS = [
     ("Oxelo",     [r"\boxelo\b"]),
     ("Orao",      [r"\borao\b"]),
     ("Tarmak",    [r"\btarmak\b"]),
+    ("Katadyn",   [r"\bkatadyn\b"]),
+    ("Garmin",    [r"\bgarmin\b"]),
     ("Decathlon", [r"\bdecathlon\b"]),
 ]
 
@@ -129,17 +131,13 @@ def classify(title="", handle=""):
 # ═══════════════════════════════════════════════════════════
 
 def extract_product_images(soup: BeautifulSoup) -> list[str]:
-    """
-    Full-res product images from the gallery.
-    Uses <a href> pointing to mediadecathlon.com/p{id}/... (NOT /b which are icons).
-    """
+    """Full-res gallery images — <a href> pointing to mediadecathlon.com/p..."""
     seen, urls = set(), []
     for a in soup.select("a[href*='mediadecathlon.com/p']"):
         href = a.get("href", "").split("?")[0]
         if href and href not in seen:
             seen.add(href)
             urls.append(href)
-    # Fallback — img src
     if not urls:
         for img in soup.select("img[src*='mediadecathlon.com/p']"):
             src = (img.get("src") or "").split("?")[0]
@@ -153,15 +151,6 @@ def images_to_fields(urls: list[str]) -> dict:
     for i in range(1, MAX_IMAGES + 1):
         fields[f"image_url_{i}"] = urls[i - 1] if i <= len(urls) else ""
     return fields
-
-def listing_images(card) -> list[str]:
-    seen, urls = set(), []
-    for img in card.select("img[src*='mediadecathlon.com/p']"):
-        src = (img.get("src") or img.get("data-src") or "").split("?")[0]
-        if src and src not in seen:
-            seen.add(src)
-            urls.append(src)
-    return urls
 
 # ═══════════════════════════════════════════════════════════
 # HTTP
@@ -196,7 +185,7 @@ def fetch_url(session: requests.Session, url: str, retries: int = 2) -> str | No
     return None
 
 # ═══════════════════════════════════════════════════════════
-# CATEGORY PAGE PARSER
+# CATEGORY PAGE PARSER  — card = <li> not <a>
 # ═══════════════════════════════════════════════════════════
 
 def parse_product_url_path(href: str):
@@ -204,37 +193,46 @@ def parse_product_url_path(href: str):
     return (m.group(1), m.group(2)) if m else ("", "")
 
 def parse_page(html: str) -> list[dict]:
-    soup  = BeautifulSoup(html, "lxml")
-    cards = soup.select("a[href*='/p/']")
+    soup = BeautifulSoup(html, "lxml")
 
-    seen, unique = set(), []
-    for c in cards:
-        href = c.get("href", "")
-        if href and href not in seen and re.search(r'/p/\d+', href):
-            seen.add(href)
-            unique.append(c)
+    # Each product card is a <li> that contains an <a href="/p/...">
+    # Price, rating, review_count live OUTSIDE the <a> inside the <li>
+    cards = []
+    seen_hrefs = set()
+    for li in soup.find_all("li"):
+        a = li.find("a", href=re.compile(r'/p/\d+'))
+        if not a:
+            continue
+        href = a.get("href", "")
+        if href in seen_hrefs:
+            continue
+        seen_hrefs.add(href)
+        cards.append((li, a, href))
 
     products = []
-    for card in unique:
-        href        = card.get("href", "")
-        product_url = urljoin(BASE_URL, href)
+    for li, a, href in cards:
+        product_url  = urljoin(BASE_URL, href)
         model_id, sku = parse_product_url_path(href)
 
-        # Title
-        img   = card.select_one("img")
-        title = (img.get("alt", "") if img else "") or card.get("aria-label", "")
+        # ── Title — from img alt inside <a> ────────────────
+        img   = a.select_one("img")
+        title = (img.get("alt", "") if img else "").strip()
         title = re.sub(r",?\s*press enter to access product page.*$",
                        "", title, flags=re.I).strip()
-        if not title:
-            title = card.get_text(" ", strip=True)[:80]
 
-        # Images (listing thumbnails — enriched to full-res later)
-        image_urls = listing_images(card)
+        # ── Images — collect all variant imgs inside the <li> ──
+        # Some cards show multiple colour variant thumbnails
+        seen_imgs, image_urls = set(), []
+        for im in li.select("img[src*='mediadecathlon.com']"):
+            src = (im.get("src") or "").split("?")[0]
+            if src and src not in seen_imgs:
+                seen_imgs.add(src)
+                image_urls.append(src)
 
-        # Price
-        card_text = card.get_text(" ", strip=True)
-        prices = []
-        for p in re.findall(r'KES\s*([\d,]+\.?\d*)', card_text):
+        # ── Price — from the <li> full text (NOT just <a>) ──
+        li_text = li.get_text(" ", strip=True)
+        prices  = []
+        for p in re.findall(r'KES\s*([\d,]+(?:\.\d+)?)', li_text):
             try:
                 prices.append(float(p.replace(",", "")))
             except Exception:
@@ -245,48 +243,45 @@ def parse_page(html: str) -> list[dict]:
         if min_price and original_price and original_price > min_price:
             discount_pct = round((1 - min_price / original_price) * 100)
 
-        # Rating
+        # ── Rating ─────────────────────────────────────────
         rating = ""
-        rm = re.search(r'([\d.]+)\s*out of 5', card_text)
+        rm = re.search(r'([\d.]+)\s*out of 5', li_text)
         if rm:
             try:
                 rating = float(rm.group(1))
             except Exception:
                 pass
+
+        # ── Review count — standalone number after rating ──
         review_count = ""
-        nums = re.findall(r'\b(\d[\d,]*)\b', card_text)
-        if nums:
+        rm2 = re.search(r'out of 5 stars?\.\s*([\d,]+)', li_text)
+        if rm2:
             try:
-                review_count = int(nums[-1].replace(",", ""))
+                review_count = int(rm2.group(1).replace(",", ""))
             except Exception:
                 pass
-
-        # Internal product ID from data attributes (if present in listing)
-        internal_id = (card.get("data-id-product") or
-                       card.get("data-product-id") or "")
 
         brand          = detect_brand(title=title, handle=href)
         audience, dept = classify(title=title, handle=href)
 
         products.append({
-            "model_id":          model_id,
-            "sku":               sku,
-            "internal_id":       internal_id,
-            "title":             title,
-            "brand":             brand,
-            "audience":          audience,
-            "department":        dept,
-            "product_url":       product_url,
-            "min_price":         min_price,
-            "original_price":    original_price,
-            "discount_pct":      discount_pct,
-            "currency":          "KES",
-            "rating":            rating,
-            "review_count":      review_count,
+            "model_id":       model_id,
+            "sku":            sku,
+            "internal_id":    "",
+            "title":          title,
+            "brand":          brand,
+            "audience":       audience,
+            "department":     dept,
+            "product_url":    product_url,
+            "min_price":      min_price,
+            "original_price": original_price,
+            "discount_pct":   discount_pct,
+            "currency":       "KES",
+            "rating":         rating,
+            "review_count":   review_count,
             **images_to_fields(image_urls),
-            "description_short": "",
-            "description_long":  "",
-            "source_method":     "category-listing",
+            "description":    "",   # requires enrich mode
+            "source_method":  "category-listing",
         })
 
     return products
@@ -303,20 +298,19 @@ def enrich_one(args) -> dict:
 
     soup = BeautifulSoup(html, "lxml")
 
-    # ── All product images (full-res) ──────────────────────
+    # ── All product images (full-res gallery) ──────────────
     all_imgs = extract_product_images(soup)
     if all_imgs:
         product.update(images_to_fields(all_imgs))
 
     # ── Internal product ID  e.g. "ID8977518" → "8977518" ──
-    if not product.get("internal_id"):
-        id_node = soup.find(string=re.compile(r'^ID\s*\d+$'))
-        if id_node:
-            m = re.search(r'(\d+)', id_node.strip())
-            if m:
-                product["internal_id"] = m.group(1)
+    id_node = soup.find(string=re.compile(r'^\s*ID\s*\d+\s*$'))
+    if id_node:
+        m = re.search(r'(\d+)', id_node)
+        if m:
+            product["internal_id"] = m.group(1)
 
-    # ── Brand — uppercase text block directly before <h1> ──
+    # ── Brand — uppercase text directly before <h1> ────────
     if not product.get("brand"):
         h1 = soup.select_one("h1")
         if h1:
@@ -325,82 +319,32 @@ def enrich_one(args) -> dict:
                 if text and len(text) < 30 and re.match(r"^[A-Z][A-Z'\- ]+$", text):
                     product["brand"] = text.title()
                     break
-    if not product.get("brand"):
-        for sel in ["[class*='manufacturer']", "[class*='brand']", "[itemprop='brand']"]:
-            el = soup.select_one(sel)
-            if el:
-                product["brand"] = el.get_text(strip=True).title()
-                break
 
-    # ── Short description — paragraphs under title/rating ──
-    short_desc = ""
+    # ── Description — text between rating block and ID/price
+    # Structure: h1 → rating → description paragraphs → ID → KES price
+    # Most reliable: extract text from the full page between known anchors
+    full_text = soup.get_text("\n", strip=True)
 
-    # Try PrestaShop standard selectors first
-    for sel in [
-        "#product-description-short",
-        ".product-description-short",
-        "[itemprop='description']",
-        ".product-shortdesc",
-        ".short-description",
-        ".product-short-description",
-        "#short_description_content",
-    ]:
-        el = soup.select_one(sel)
-        if el:
-            short_desc = el.get_text(" ", strip=True)
-            break
+    # Grab text between "reviews" / "stars" block and "ID\d+" or "KES"
+    desc = ""
+    m = re.search(
+        r'(?:reviews?|out of 5 stars?)[.\s\n]+(.*?)(?:\n\s*ID\s*\d+|\n\s*KES)',
+        full_text,
+        re.DOTALL | re.I,
+    )
+    if m:
+        raw = m.group(1).strip()
+        # Keep only meaningful lines (skip noise like "4.7 4.7", short codes)
+        lines = [
+            ln.strip() for ln in raw.splitlines()
+            if len(ln.strip()) > 25
+            and not re.match(r'^[\d.\s]+$', ln.strip())
+            and not re.search(r'press enter|out of 5|KES|VAT|select|choose|add to', ln, re.I)
+        ]
+        desc = " ".join(lines).strip()
 
-    # Fallback — collect <p> siblings after <h1> until price block
-    if not short_desc:
-        h1 = soup.select_one("h1")
-        if h1:
-            paras = []
-            for sib in h1.find_next_siblings():
-                sib_text = sib.get_text(" ", strip=True)
-                # Stop when we hit price / cart / size sections
-                if re.search(r'KES|add.to.basket|select.size|choose.size', sib_text, re.I):
-                    break
-                if sib.name == "p" and len(sib_text) > 20:
-                    paras.append(sib_text)
-                # Also grab direct text in divs with no child blocks
-                if sib.name == "div" and len(sib_text) > 20:
-                    inner_paras = [p.get_text(" ", strip=True)
-                                   for p in sib.select("p") if len(p.get_text(strip=True)) > 20]
-                    paras.extend(inner_paras)
-                if len(paras) >= 3:
-                    break
-            short_desc = " | ".join(paras)
-
-    if short_desc:
-        product["description_short"] = short_desc[:800]
-
-    # ── Long description — Features / Design details ────────
-    long_desc = ""
-    for sel in [
-        "#product-description",
-        ".product-description:not(.product-description-short)",
-        "[class*='product-detail']",
-        "#description",
-        "[class*='features']",
-    ]:
-        el = soup.select_one(sel)
-        if el:
-            text = el.get_text(" ", strip=True)
-            if len(text) > 50:
-                long_desc = text
-                break
-
-    # Fallback — find the Features / Design benefits section
-    if not long_desc:
-        for heading in soup.find_all(["h2", "h3"],
-                                     string=re.compile(r'feature|design|benefit|detail', re.I)):
-            container = heading.find_parent(["section", "div"])
-            if container:
-                long_desc = container.get_text(" ", strip=True)
-                break
-
-    if long_desc:
-        product["description_long"] = long_desc[:1500]
+    if desc:
+        product["description"] = desc[:800]
 
     product["source_method"] = "product-page"
     return product
@@ -415,7 +359,7 @@ class Cfg:
     category_label: str
     max_pages:      int      = 10
     workers:        int      = 8
-    enrich:         bool     = False
+    enrich:         bool     = True    # ON by default — gets description + full images
     enrich_workers: int      = 10
     retries:        int      = 2
     log:            Callable = field(default=print, repr=False)
@@ -429,7 +373,6 @@ def run_scrape(cfg: Cfg) -> list:
     cfg.log("---")
     session = make_session()
 
-    # Page 1 probe
     cfg.log("  📡 Probing page 1…")
     html1 = fetch_url(session, _page_url(cfg.category_path, 1), retries=cfg.retries)
     if not html1:
@@ -445,10 +388,10 @@ def run_scrape(cfg: Cfg) -> list:
     all_products = list(first_prods)
     seen_urls    = {p["product_url"] for p in all_products}
 
-    # Remaining pages in parallel
+    # Parallel fetch remaining pages
     remaining = list(range(2, cfg.max_pages + 1))
     if remaining:
-        cfg.log(f"  ⚡ Fetching pages 2–{cfg.max_pages} with {cfg.workers} workers…")
+        cfg.log(f"  ⚡ Fetching pages 2–{cfg.max_pages} ({cfg.workers} workers)…")
 
         def fetch_and_parse(page_num):
             html = fetch_url(session, _page_url(cfg.category_path, page_num),
@@ -469,14 +412,14 @@ def run_scrape(cfg: Cfg) -> list:
                 all_products.extend(new)
                 cfg.log(f"  ✅ Page {page_num}: +{len(new)} (total: {len(all_products)})")
 
-    cfg.log(f"  📦 {len(all_products)} unique products collected.")
+    cfg.log(f"  📦 {len(all_products)} unique products.")
 
-    # Parallel enrichment
+    # Parallel enrichment — full images + brand + description
     if cfg.enrich and all_products:
-        cfg.log(f"  🖼️ Enriching {len(all_products)} products "
+        cfg.log(f"  🖼️ Enriching {len(all_products)} product pages "
                 f"({cfg.enrich_workers} workers)…")
-        prog = st.progress(0, text="Enriching product pages…")
-        args = [(session, p) for p in all_products]
+        prog = st.progress(0, text="Fetching descriptions + images…")
+        args     = [(session, p) for p in all_products]
         enriched = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.enrich_workers) as ex:
             for i, result in enumerate(ex.map(enrich_one, args), 1):
@@ -484,14 +427,15 @@ def run_scrape(cfg: Cfg) -> list:
                 prog.progress(
                     i / len(all_products),
                     text=f"🖼️ {i}/{len(all_products)} — "
-                         f"{result.get('image_count', 0)} images | "
-                         f"{result.get('brand', '—')} | "
-                         f"{len(result.get('description_short',''))} chars"
+                         f"{result.get('brand','—')} | "
+                         f"imgs: {result.get('image_count',0)} | "
+                         f"desc: {'✅' if result.get('description') else '—'}"
                 )
         prog.empty()
         all_products = enriched
-        total_imgs = sum(p.get("image_count", 0) for p in all_products)
-        cfg.log(f"  ✅ Enrichment done — {total_imgs} total images.")
+        has_desc  = sum(1 for p in all_products if p.get("description"))
+        total_img = sum(p.get("image_count", 0) for p in all_products)
+        cfg.log(f"  ✅ {has_desc}/{len(all_products)} descriptions | {total_img} total images.")
 
     cfg.log(f"✅ Done. **{len(all_products)} products** ready.")
     return all_products
@@ -535,9 +479,8 @@ def render_downloads(df: pd.DataFrame, label: str):
 
 st.set_page_config(page_title="Decathlon Kenya Scraper", page_icon="🛒", layout="wide")
 st.title("🛒 Decathlon Kenya Scraper")
-st.caption(f"Target: **{BASE_URL}** — Up to {MAX_IMAGES} full-res images + brand + descriptions.")
+st.caption(f"Target: **{BASE_URL}** — price, rating, description, up to {MAX_IMAGES} images per product.")
 
-# Session state
 if "products"  not in st.session_state: st.session_state.products  = []
 if "cat_label" not in st.session_state: st.session_state.cat_label = ""
 if "df_show"   not in st.session_state: st.session_state.df_show   = None
@@ -556,25 +499,22 @@ with st.sidebar:
     if all_pages:
         st.caption("⚠️ No page limit.")
 
-    workers = st.slider("⚡ Parallel workers", 1, 20, 8)
+    workers = st.slider("⚡ Parallel workers (listing)", 1, 20, 8)
 
     st.divider()
     enrich = st.toggle(
-        "🖼️ Fetch ALL images + brand + descriptions",
-        value=False,
-        help="Visits every product page — gets up to 10 full-res images, "
-             "brand, short description and long description.",
+        "🖼️ Fetch descriptions + all images",
+        value=True,
+        help="Visits every product page — gets description text, brand, "
+             "internal ID and up to 10 full-res images.",
     )
     enrich_workers = st.slider("Enrich workers", 1, 20, 10) if enrich else 10
-    if enrich:
-        st.caption(f"Fetches full-res images + brand + both description fields per product.")
 
     export_cols = st.multiselect("Export columns", ALL_EXPORT_COLUMNS,
                                  default=ALL_EXPORT_COLUMNS)
     st.divider()
     run_btn = st.button("▶️ Start Scraping", type="primary", use_container_width=True)
 
-# ── Run ────────────────────────────────────────────────────
 if run_btn:
     cfg = Cfg(
         category_path=cat_path,
@@ -618,7 +558,6 @@ if run_btn:
     st.session_state.cat_label = cat_label
     st.session_state.df_show   = df[cols_present] if cols_present else df
 
-# ── Results (from session_state — survive any button click) ──
 if st.session_state.products:
     products  = st.session_state.products
     cat_label = st.session_state.cat_label
@@ -626,7 +565,6 @@ if st.session_state.products:
 
     st.success(f"✅ **{len(products)}** products from **{cat_label}**")
 
-    # Metrics
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Products",    len(products))
     c2.metric("Brands",      len({p.get("brand","") for p in products if p.get("brand")}))
@@ -634,49 +572,37 @@ if st.session_state.products:
     c3.metric("Avg (KES)",   f"{sum(vp)/len(vp):,.0f}" if vp else "—")
     c4.metric("Min (KES)",   f"{min(vp):,.0f}" if vp else "—")
     c5.metric("Max (KES)",   f"{max(vp):,.0f}" if vp else "—")
-    total_imgs = sum(p.get("image_count", 0) for p in products)
-    c6.metric("Total Images", total_imgs)
+    c6.metric("With Desc.",  sum(1 for p in products if p.get("description")))
 
-    # Breakdowns
     st.divider()
     df_full = pd.DataFrame(products)
     col_a, col_b, col_c = st.columns(3)
     with col_a:
         st.markdown("**Brand**")
-        st.dataframe(
-            df_full["brand"].replace("","Unknown").value_counts().rename("count"),
-            use_container_width=True,
-        )
+        st.dataframe(df_full["brand"].replace("","Unknown").value_counts().rename("count"),
+                     use_container_width=True)
     with col_b:
         st.markdown("**Audience**")
-        st.dataframe(
-            df_full["audience"].replace("","Unclassified").value_counts().rename("count"),
-            use_container_width=True,
-        )
+        st.dataframe(df_full["audience"].replace("","Unclassified").value_counts().rename("count"),
+                     use_container_width=True)
     with col_c:
         st.markdown("**Department**")
-        st.dataframe(
-            df_full["department"].replace("","Unclassified").value_counts().rename("count"),
-            use_container_width=True,
-        )
+        st.dataframe(df_full["department"].replace("","Unclassified").value_counts().rename("count"),
+                     use_container_width=True)
 
     disc = df_full[df_full["discount_pct"].astype(str).str.strip() != ""]
     if not disc.empty:
-        st.info(
-            f"🏷️ **{len(disc)}** products on sale — "
-            f"avg {pd.to_numeric(disc['discount_pct'], errors='coerce').mean():.0f}% off"
-        )
+        st.info(f"🏷️ **{len(disc)}** products on sale — "
+                f"avg {pd.to_numeric(disc['discount_pct'], errors='coerce').mean():.0f}% off")
 
-    # Image gallery — all angles
     st.divider()
-    with st.expander("🖼️ Image gallery (first 8 products — all angles)", expanded=False):
+    with st.expander("🖼️ Image gallery (first 8 products)", expanded=False):
         for p in products[:8]:
             imgs = [p.get(f"image_url_{i}","") for i in range(1, MAX_IMAGES + 1)
                     if p.get(f"image_url_{i}")]
             if not imgs:
                 continue
-            st.markdown(f"**{p.get('title','')[:60]}** — {len(imgs)} image(s) | "
-                        f"{p.get('brand','—')}")
+            st.markdown(f"**{p.get('title','')[:60]}** — {len(imgs)} image(s)")
             cols = st.columns(min(len(imgs), 5))
             for idx, img_url in enumerate(imgs[:5]):
                 with cols[idx]:
@@ -685,17 +611,12 @@ if st.session_state.products:
                     except Exception:
                         st.caption(f"img {idx+1}")
 
-    # Description preview
     with st.expander("📝 Description preview (first 5 products)", expanded=False):
         for p in products[:5]:
-            short = p.get("description_short","")
-            long  = p.get("description_long","")
-            if short or long:
+            desc = p.get("description","")
+            if desc:
                 st.markdown(f"**{p.get('title','')[:60]}**")
-                if short:
-                    st.markdown(f"*Short:* {short[:300]}")
-                if long:
-                    st.markdown(f"*Long:* {long[:300]}…")
+                st.write(desc[:400])
                 st.divider()
 
     st.subheader("📋 Results")

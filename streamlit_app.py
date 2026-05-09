@@ -1,17 +1,3 @@
-"""
-Decathlon Scraper — Browser-Free Edition
-=========================================
-No Playwright. No Selenium. No browser. Works on Streamlit Cloud instantly.
-
-requirements.txt:
-    streamlit
-    cloudscraper
-    beautifulsoup4
-    lxml
-    pandas
-    openpyxl
-"""
-
 from __future__ import annotations
 
 import io
@@ -27,13 +13,13 @@ import cloudscraper
 import pandas as pd
 import requests
 import streamlit as st
-
+from bs4 import BeautifulSoup
 
 # ═══════════════════════════════════════════════════════════
 # 1. CONFIGURATION
 # ═══════════════════════════════════════════════════════════
 
-COUNTRIES: dict[str, str] = {
+COUNTRIES = {
     "🇮🇳 India":           "https://www.decathlon.in",
     "🇫🇷 France":          "https://www.decathlon.fr",
     "🇧🇪 Belgium":         "https://www.decathlon.be",
@@ -54,14 +40,14 @@ COUNTRIES: dict[str, str] = {
     "🇿🇦 South Africa":    "https://www.decathlon.co.za",
 }
 
-USER_AGENTS: list[str] = [
+USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 
-ALL_EXPORT_COLUMNS: list[str] = [
+ALL_EXPORT_COLUMNS = [
     "product_id", "model_id", "sku", "all_skus",
     "title", "brand", "audience", "department", "product_type", "tags",
     "product_url", "min_price", "currency",
@@ -70,13 +56,13 @@ ALL_EXPORT_COLUMNS: list[str] = [
     "description", "published_at", "updated_at", "source_method",
 ]
 
-DEFAULT_EXPORT_COLUMNS: list[str] = [
+DEFAULT_EXPORT_COLUMNS = [
     "model_id", "sku", "title", "brand", "audience", "department",
     "min_price", "currency", "product_url",
     "image_url_1", "all_image_urls", "variant_count", "description",
 ]
 
-HTML_SELECTORS: list[str] = [
+HTML_SELECTORS = [
     "div[data-testid='product-card']",
     "article.vtmn-card",
     "div.vtmn-card",
@@ -89,19 +75,18 @@ HTML_SELECTORS: list[str] = [
     "a.product-link",
 ]
 
-
 # ═══════════════════════════════════════════════════════════
 # 2. HTTP SESSION
 # ═══════════════════════════════════════════════════════════
 
-def create_session() -> cloudscraper.CloudScraper:
+def create_session():
     session = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False},
     )
     session.headers.update({
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "DNT":             "1",
         "Connection":      "keep-alive",
         "User-Agent":      random.choice(USER_AGENTS),
@@ -109,8 +94,7 @@ def create_session() -> cloudscraper.CloudScraper:
     return session
 
 
-def fetch(session, url: str, retries: int = 3,
-          delay: tuple = (1, 3), log: Callable = print) -> Optional[requests.Response]:
+def fetch(session, url, retries=3, delay=(1, 3), log=print):
     for attempt in range(1, retries + 1):
         try:
             resp = session.get(url, timeout=20, allow_redirects=True)
@@ -123,7 +107,7 @@ def fetch(session, url: str, retries: int = 3,
             t = random.uniform(*delay)
             log(f"  ⏱ Retrying in {t:.1f}s…")
             time.sleep(t)
-    log(f"  ❌ All {retries} attempts failed for: {url}")
+    log(f"  ❌ All {retries} attempts failed: {url}")
     return None
 
 
@@ -171,7 +155,7 @@ _DEPARTMENT_RULES = [
 ]
 
 
-def _first_match(blob: str, rules) -> str:
+def _first_match(blob, rules):
     blob = blob.lower()
     for label, patterns in rules:
         if any(re.search(p, blob) for p in patterns):
@@ -248,9 +232,9 @@ def parse_shopify(p, base_url):
         for v in raw_v
     ]
     avail_prices = [float(v["price"]) for v in raw_v if v.get("available") and v.get("price")]
-    handle   = p.get("handle", "")
-    tags_str = ", ".join(p.get("tags", []))
-    desc     = BeautifulSoup(p.get("body_html") or "", "html.parser").get_text(" ", strip=True)
+    handle    = p.get("handle", "")
+    tags_str  = ", ".join(p.get("tags", []))
+    desc      = BeautifulSoup(p.get("body_html") or "", "html.parser").get_text(" ", strip=True)
     first_sku = raw_v[0].get("sku", "") if raw_v else ""
     all_skus  = list(dict.fromkeys(v.get("sku", "") for v in raw_v if v.get("sku")))
     images    = [img.get("src", "") for img in p.get("images", []) if img.get("src")]
@@ -442,7 +426,7 @@ class ScrapeConfig:
     log:       Callable = field(default=print, repr=False)
 
 
-def strategy_shopify(session, cfg: ScrapeConfig) -> Optional[list]:
+def strategy_shopify(session, cfg):
     products = []
     cfg.log("### Strategy 1 — Shopify /products.json")
     for page_num in range(1, cfg.max_pages + 1):
@@ -454,10 +438,10 @@ def strategy_shopify(session, cfg: ScrapeConfig) -> Optional[list]:
         try:
             data = resp.json()
         except Exception:
-            cfg.log("  ❌ Response is not JSON — site is not Shopify.")
+            cfg.log("  ❌ Not JSON — not a Shopify site.")
             return None
         if "products" not in data:
-            cfg.log("  ❌ No 'products' key — site is not Shopify.")
+            cfg.log("  ❌ No products key — not a Shopify site.")
             return None
         page_prods = data["products"]
         if not page_prods:
@@ -496,7 +480,7 @@ def _extract_next_data(html, base_url, log):
         if not candidates:
             return None
         best = max(candidates, key=len)
-        log(f"  ✅ __NEXT_DATA__: {len(best)} items found")
+        log(f"  ✅ __NEXT_DATA__: {len(best)} items")
         return [parse_next(p, base_url) for p in best]
     except Exception as exc:
         log(f"  ⚠️ __NEXT_DATA__ parse error: {exc}")
@@ -520,13 +504,13 @@ def _find_algolia_creds(html, log):
                 results[key] = m.group(1) if m.lastindex else m.group(0)
                 break
     if all(k in results for k in ("app_id", "api_key", "index")):
-        log(f"  ✅ Algolia found (app: {results['app_id']}, index: {results['index']})")
+        log(f"  ✅ Algolia found — app: {results['app_id']}, index: {results['index']}")
         return results["app_id"], results["api_key"], results["index"]
-    log("  ℹ️ No Algolia credentials in page.")
+    log("  ℹ️ No Algolia credentials found.")
     return None
 
 
-def strategy_algolia(session, cfg: ScrapeConfig, app_id, api_key, index_name) -> Optional[list]:
+def strategy_algolia(session, cfg, app_id, api_key, index_name):
     cfg.log(f"### Strategy 2 — Algolia API ({index_name})")
     products = []
     url = f"https://{app_id}-dsn.algolia.net/1/indexes/{index_name}/query"
@@ -554,10 +538,10 @@ def strategy_algolia(session, cfg: ScrapeConfig, app_id, api_key, index_name) ->
     return products if products else None
 
 
-def strategy_html(session, cfg: ScrapeConfig) -> list:
+def strategy_html(session, cfg):
     cfg.log("### Strategy 3 — HTML / BeautifulSoup")
     products = []
-    search_templates = [
+    templates = [
         f"{cfg.base_url}/search?query={quote(cfg.keyword)}&page={{p}}",
         f"{cfg.base_url}/search?Ntt={quote(cfg.keyword)}&page={{p}}",
         f"{cfg.base_url}/catalogsearch/result/?q={quote(cfg.keyword)}&p={{p}}",
@@ -565,7 +549,7 @@ def strategy_html(session, cfg: ScrapeConfig) -> list:
     ]
     for page_num in range(1, cfg.max_pages + 1):
         resp = None
-        for tmpl in search_templates:
+        for tmpl in templates:
             url = tmpl.format(p=page_num)
             cfg.log(f"  🔍 Page {page_num} → {url}")
             resp = fetch(session, url, retries=cfg.retries, delay=cfg.delay, log=cfg.log)
@@ -574,10 +558,8 @@ def strategy_html(session, cfg: ScrapeConfig) -> list:
         if not resp:
             cfg.log("  ❌ All URL templates failed.")
             break
-
         html = resp.text
         page_prods = _extract_next_data(html, cfg.base_url, cfg.log)
-
         if not page_prods:
             cfg.log("  🔧 Falling back to HTML card parsing…")
             soup = BeautifulSoup(html, "lxml")
@@ -587,46 +569,39 @@ def strategy_html(session, cfg: ScrapeConfig) -> list:
                     cfg.log(f"  ✅ Selector '{sel}': {len(cards)} cards")
                     page_prods = [parse_html(c, cfg.base_url) for c in cards]
                     break
-
         if not page_prods:
             cfg.log("  ⛔ No products found — stopping.")
             break
-
         products.extend(page_prods)
         cfg.log(f"  📊 Running total: {len(products)} products")
         time.sleep(random.uniform(*cfg.delay))
     return products
 
 
-def run_scrape(cfg: ScrapeConfig) -> list:
+def run_scrape(cfg):
     pages_label = "ALL" if cfg.max_pages == 9999 else str(cfg.max_pages)
     cfg.log(f"🚀 **{cfg.base_url}** | keyword: `{cfg.keyword}` | max pages: {pages_label}")
     cfg.log("---")
-
     session  = create_session()
     products = []
 
-    # Strategy 1: Shopify
     result = strategy_shopify(session, cfg)
     if result:
         products = result
-        cfg.log(f"✅ Shopify strategy succeeded with {len(products)} products.")
+        cfg.log(f"✅ Shopify strategy: {len(products)} products.")
     else:
-        # Scan page for Algolia credentials
-        cfg.log("⚠️ Strategy 1 failed. Scanning page for Algolia credentials…")
-        search_url = f"{cfg.base_url}/search?query={quote(cfg.keyword)}"
-        resp = fetch(session, search_url, retries=2, delay=cfg.delay, log=cfg.log)
+        cfg.log("⚠️ Strategy 1 failed. Scanning for Algolia credentials…")
+        resp = fetch(session, f"{cfg.base_url}/search?query={quote(cfg.keyword)}",
+                     retries=2, delay=cfg.delay, log=cfg.log)
         html = resp.text if resp else ""
         algolia_creds = _find_algolia_creds(html, cfg.log) if html else None
 
-        # Strategy 2: Algolia
         if algolia_creds:
             result = strategy_algolia(session, cfg, *algolia_creds)
             if result:
                 products = result
-                cfg.log(f"✅ Algolia strategy succeeded with {len(products)} products.")
+                cfg.log(f"✅ Algolia strategy: {len(products)} products.")
 
-        # Strategy 3: HTML fallback
         if not products:
             cfg.log("⚠️ Switching to HTML scraping…")
             cfg.log("---")
@@ -670,19 +645,15 @@ with st.sidebar:
     country_label = st.selectbox("Country / Site", list(COUNTRIES.keys()))
     base_url      = COUNTRIES[country_label]
     st.caption(f"`{base_url}`")
-
     keyword = st.text_input("Search keyword", value="vélo")
-
     all_pages_toggle = st.toggle("📄 Scrape ALL pages", value=False)
     if all_pages_toggle:
         st.caption("⚠️ No page limit.")
         max_pages = 9999
     else:
         max_pages = st.slider("Max pages", 1, 100, 5)
-
     delay_min, delay_max = st.slider("Delay between requests (s)", 0, 8, (1, 3))
     retries = st.slider("Retries per request", 1, 4, 2)
-
     st.divider()
     export_cols = st.multiselect("Export columns", ALL_EXPORT_COLUMNS,
                                  default=DEFAULT_EXPORT_COLUMNS)
@@ -699,7 +670,7 @@ if run_btn:
         max_pages=max_pages, delay=(delay_min, delay_max), retries=retries,
     )
 
-    log_lines: list[str] = []
+    log_lines: list = []
     log_box    = st.empty()
     status_box = st.empty()
 

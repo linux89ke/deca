@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 from urllib.parse import urljoin, quote
 
-# ── Playwright browser path MUST be set before importing playwright ───────────
 _PW_HOME = "/tmp/pw-browsers"
 os.makedirs(_PW_HOME, exist_ok=True)
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _PW_HOME
@@ -26,13 +25,12 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 # ═══════════════════════════════════════════════════════════
-# 1. PLAYWRIGHT BROWSER MANAGER
+# 1. BROWSER MANAGER
 # ═══════════════════════════════════════════════════════════
 
 @st.cache_resource(show_spinner="⏳ Installing Chromium (one-time)…")
-def _install_browser() -> Optional[str]:
+def _install_browser():
     pw_env = {**os.environ, "PLAYWRIGHT_BROWSERS_PATH": _PW_HOME}
-    # Try with system deps first, fall back to plain install
     for extra in [["--with-deps"], []]:
         try:
             r = subprocess.run(
@@ -43,7 +41,6 @@ def _install_browser() -> Optional[str]:
                 break
         except Exception:
             pass
-    # Locate the binary
     for pattern in [f"{_PW_HOME}/**/chrome-headless-shell",
                     f"{_PW_HOME}/**/chromium",
                     f"{_PW_HOME}/**/chrome"]:
@@ -53,7 +50,7 @@ def _install_browser() -> Optional[str]:
             return hits[0]
     return None
 
-CHROMIUM_EXEC: Optional[str] = _install_browser()
+CHROMIUM_EXEC = _install_browser()
 
 CHROMIUM_ARGS = [
     "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
@@ -119,11 +116,9 @@ HTML_SELECTORS = [
 
 _AUDIENCE_RULES = [
     ("Kids",  [r"\benfant[s]?\b", r"\bjunior[s]?\b", r"\bkid[s]?\b", r"\bchild(ren)?\b",
-               r"\bgamin[s]?\b", r"\bfille[s]?\b", r"\bgar[çc]on[s]?\b",
                r"\bboy[s]?\b", r"\bgirl[s]?\b", r"\byouth\b", r"\bbaby\b"]),
-    ("Women", [r"\bfemme[s]?\b", r"\bwoman\b", r"\bwomen\b", r"\bféminin\b",
-               r"\bwomens\b", r"\bladies\b", r"\bdame[s]?\b"]),
-    ("Men",   [r"\bhomme[s]?\b", r"\bman\b", r"\bmen\b", r"\bmasculin\b", r"\bmens\b"]),
+    ("Women", [r"\bfemme[s]?\b", r"\bwoman\b", r"\bwomen\b", r"\bwomens\b", r"\bladies\b"]),
+    ("Men",   [r"\bhomme[s]?\b", r"\bman\b", r"\bmen\b", r"\bmens\b"]),
 ]
 
 _DEPARTMENT_RULES = [
@@ -137,14 +132,11 @@ _DEPARTMENT_RULES = [
     ("Skiing",       [r"\bski\b", r"\bsnow\b", r"\balpine\b"]),
     ("Basketball",   [r"\bbasketball\b", r"\bbasket\b"]),
     ("Camping",      [r"\bcamping\b", r"\btente\b", r"\bbivouac\b"]),
-    ("Water Sports", [r"\bsurf\b", r"\bkayak\b", r"\bcanoe\b", r"\bpaddle\b", r"\bdiving\b"]),
+    ("Water Sports", [r"\bsurf\b", r"\bkayak\b", r"\bcanoe\b", r"\bpaddle\b"]),
     ("Martial Arts", [r"\bjudo\b", r"\bkarate\b", r"\bboxe?\b", r"\bmartial\b"]),
-    ("Rugby",        [r"\brugby\b"]),
-    ("Volleyball",   [r"\bvolleyball\b", r"\bvolley\b"]),
-    ("Golf",         [r"\bgolf\b"]),
-    ("Clothing",     [r"\bvêtement[s]?\b", r"\bjacket\b", r"\blegging[s]?\b", r"\bshort[s]?\b"]),
-    ("Footwear",     [r"\bchaussure[s]?\b", r"\bshoe[s]?\b", r"\bsneaker[s]?\b", r"\bboot[s]?\b"]),
-    ("Accessories",  [r"\baccessoire[s]?\b", r"\bsac[s]?\b", r"\bbag[s]?\b"]),
+    ("Clothing",     [r"\bjacket\b", r"\blegging[s]?\b", r"\bshort[s]?\b", r"\btshirt\b"]),
+    ("Footwear",     [r"\bshoe[s]?\b", r"\bsneaker[s]?\b", r"\bboot[s]?\b"]),
+    ("Accessories",  [r"\bbag[s]?\b", r"\bgant[s]?\b", r"\bglove[s]?\b"]),
 ]
 
 def _first_match(blob, rules):
@@ -339,7 +331,7 @@ def _extract_next_data(html, base_url, log):
         log(f"  ✅ __NEXT_DATA__: {len(best)} items")
         return [parse_next(p, base_url) for p in best]
     except Exception as exc:
-        log(f"  ⚠️ __NEXT_DATA__ parse error: {exc}")
+        log(f"  ⚠️ __NEXT_DATA__ error: {exc}")
         return None
 
 def _parse_html_cards(html, base_url, log):
@@ -347,7 +339,7 @@ def _parse_html_cards(html, base_url, log):
     for sel in HTML_SELECTORS:
         cards = soup.select(sel)
         if cards:
-            log(f"  ✅ Selector '{sel}': {len(cards)} cards")
+            log(f"  ✅ HTML selector '{sel}': {len(cards)} cards")
             return [parse_html(c, base_url) for c in cards]
     return None
 
@@ -360,12 +352,12 @@ class ScrapeConfig:
     base_url:  str
     keyword:   str
     max_pages: int      = 5
-    delay:     tuple    = (1, 3)
+    delay:     tuple    = (2, 4)
     retries:   int      = 2
     log:       Callable = field(default=print, repr=False)
 
 # ═══════════════════════════════════════════════════════════
-# 7. CLOUDSCRAPER STRATEGIES (primary, no browser)
+# 7. CLOUDSCRAPER (primary — no browser)
 # ═══════════════════════════════════════════════════════════
 
 def create_session():
@@ -391,8 +383,7 @@ def cs_fetch(session, url, retries=3, delay=(1, 3), log=print):
         except Exception as exc:
             log(f"  ⚠️ Error (attempt {attempt}/{retries}): {str(exc)[:80]}")
         if attempt < retries:
-            t = random.uniform(*delay)
-            time.sleep(t)
+            time.sleep(random.uniform(*delay))
     return None
 
 def cs_shopify(session, cfg):
@@ -407,14 +398,13 @@ def cs_shopify(session, cfg):
         try:
             data = resp.json()
         except Exception:
-            cfg.log("  ❌ Not JSON — not Shopify.")
+            cfg.log("  ❌ Not JSON.")
             return None
         if "products" not in data:
             cfg.log("  ❌ No products key.")
             return None
         page_prods = data["products"]
         if not page_prods:
-            cfg.log(f"  ✅ No more products at page {page_num}.")
             break
         for p in page_prods:
             products.append(parse_shopify(p, cfg.base_url))
@@ -435,159 +425,215 @@ def cs_html(session, cfg):
         resp = None
         for tmpl in templates:
             url = tmpl.format(p=page_num)
-            cfg.log(f"  🔍 Page {page_num} → {url}")
+            cfg.log(f"  🔍 {url}")
             resp = cs_fetch(session, url, retries=cfg.retries, delay=cfg.delay, log=cfg.log)
             if resp:
                 break
         if not resp:
-            cfg.log("  ❌ All URL templates failed.")
+            cfg.log("  ❌ All templates failed.")
             break
         html = resp.text
         page_prods = _extract_next_data(html, cfg.base_url, cfg.log)
         if not page_prods:
-            cfg.log("  🔧 Trying HTML card parsing…")
             page_prods = _parse_html_cards(html, cfg.base_url, cfg.log)
         if not page_prods:
             cfg.log("  ⛔ No products — stopping.")
             break
         products.extend(page_prods)
-        cfg.log(f"  📊 Running total: {len(products)} products")
+        cfg.log(f"  📊 Total: {len(products)}")
         time.sleep(random.uniform(*cfg.delay))
     return products
 
 # ═══════════════════════════════════════════════════════════
-# 8. PLAYWRIGHT STRATEGY (fallback, for JS-heavy SPAs)
+# 8. PLAYWRIGHT (fallback — real browser)
 # ═══════════════════════════════════════════════════════════
 
-def _slow_scroll(page):
+def _new_browser_context(pw):
+    """Launch browser + stealth context. Returns (browser, context)."""
+    browser = pw.chromium.launch(
+        headless=True,
+        executable_path=CHROMIUM_EXEC,
+        args=CHROMIUM_ARGS,
+    )
+    ctx = browser.new_context(
+        viewport={"width": 1920, "height": 1080},
+        user_agent=random.choice(USER_AGENTS),
+        java_script_enabled=True,
+        bypass_csp=True,
+        ignore_https_errors=True,
+        extra_http_headers={
+            "Accept-Language": "en-GB,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        },
+    )
+    ctx.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-GB','en']});
+    """)
+    return browser, ctx
+
+
+def _pw_get_html(page, url, wait_s, log):
+    """Navigate, wait for render, scroll, return HTML. Returns None on failure."""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    except Exception as e:
+        log(f"  ⚠️ Nav error: {str(e)[:80]}")
+        return None
+    log(f"  ⏱ Waiting {wait_s:.1f}s for JS render…")
+    time.sleep(wait_s)
+    # Gradual scroll to trigger lazy loading
     for frac in (0.25, 0.5, 0.75, 1.0):
-        page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {frac})")
-        time.sleep(0.7)
+        try:
+            page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {frac})")
+            time.sleep(0.5)
+        except Exception:
+            break
+    try:
+        return page.content()
+    except Exception:
+        return None
+
 
 def pw_scrape(cfg: ScrapeConfig) -> list:
-    cfg.log("### Playwright Fallback — headless browser")
-
+    cfg.log("### Playwright Fallback — real headless browser")
     if not CHROMIUM_EXEC:
-        cfg.log("  ❌ Chromium binary not found. Add packages.txt to your repo.")
+        cfg.log("  ❌ Chromium not found. Add packages.txt to your repo.")
         return []
-
     cfg.log(f"  🖥 Binary: {CHROMIUM_EXEC}")
+
     products = []
 
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=True,
-                executable_path=CHROMIUM_EXEC,
-                args=CHROMIUM_ARGS,
-            )
-            ctx = browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent=random.choice(USER_AGENTS),
-                java_script_enabled=True,
-                bypass_csp=True,
-                ignore_https_errors=True,
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-            )
-            ctx.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.chrome = { runtime: {} };
-            """)
-            page = ctx.new_page()
 
-            # Try Shopify JSON first (even in browser context)
-            for page_num in range(1, cfg.max_pages + 1):
-                url = f"{cfg.base_url}/products.json?q={quote(cfg.keyword)}&limit=24&page={page_num}"
-                cfg.log(f"  📦 [PW-Shopify] Page {page_num} → {url}")
-                try:
-                    resp = page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                    time.sleep(1)
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        data = json.loads(page.locator("body").inner_text())
-                    page_prods = data.get("products", [])
-                    if not page_prods:
-                        break
-                    for p in page_prods:
+            # ── Phase 1: Try Shopify JSON in browser ─────────────────────────
+            # Use a SEPARATE browser instance so a crash does not affect Phase 2
+            shopify_ok = False
+            try:
+                browser, ctx = _new_browser_context(pw)
+                page = ctx.new_page()
+                url  = f"{cfg.base_url}/products.json?q={quote(cfg.keyword)}&limit=24&page=1"
+                cfg.log(f"  📦 [PW-Shopify] → {url}")
+                page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                time.sleep(1.5)
+                body = page.locator("body").inner_text()
+                data = json.loads(body)
+                if "products" in data and data["products"]:
+                    shopify_ok = True
+                    for p in data["products"]:
                         products.append(parse_shopify(p, cfg.base_url))
-                    cfg.log(f"  ✅ +{len(page_prods)} (total: {len(products)})")
-                    if page_prods:
-                        continue
-                except Exception:
-                    cfg.log("  ℹ️ Not Shopify — switching to search pages.")
-                    products = []
-                    break
-
-            # If Shopify didn't work, scrape search pages
-            if not products:
-                templates = [
-                    f"{cfg.base_url}/search?query={quote(cfg.keyword)}&page={{p}}",
-                    f"{cfg.base_url}/search?Ntt={quote(cfg.keyword)}&page={{p}}",
-                    f"{cfg.base_url}/search?q={quote(cfg.keyword)}&page={{p}}",
-                ]
-                for page_num in range(1, cfg.max_pages + 1):
-                    fetched = False
-                    for tmpl in templates:
-                        url = tmpl.format(p=page_num)
-                        cfg.log(f"  🔍 [PW] Page {page_num} → {url}")
-                        try:
-                            page.goto(url, wait_until="domcontentloaded", timeout=40000)
-                            fetched = True
+                    cfg.log(f"  ✅ Shopify page 1: {len(products)} products")
+                    # Continue remaining pages
+                    for page_num in range(2, cfg.max_pages + 1):
+                        url = f"{cfg.base_url}/products.json?q={quote(cfg.keyword)}&limit=24&page={page_num}"
+                        page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                        time.sleep(1.5)
+                        data = json.loads(page.locator("body").inner_text())
+                        pp = data.get("products", [])
+                        if not pp:
                             break
-                        except Exception as e:
-                            cfg.log(f"  ⚠️ Nav failed: {str(e)[:60]}")
-                    if not fetched:
-                        break
+                        for p in pp:
+                            products.append(parse_shopify(p, cfg.base_url))
+                        cfg.log(f"  ✅ Shopify page {page_num}: +{len(pp)} (total {len(products)})")
+                        time.sleep(random.uniform(*cfg.delay))
+                browser.close()
+            except Exception as e:
+                cfg.log(f"  ℹ️ Shopify via browser failed: {str(e)[:80]}")
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
+            if shopify_ok:
+                return products
+
+            # ── Phase 2: Search page scraping in a FRESH browser ─────────────
+            cfg.log("  🔁 Shopify not available — starting fresh browser for search pages…")
+            browser, ctx = _new_browser_context(pw)
+
+            # Warm up: visit homepage first to receive cookies and pass WAF
+            cfg.log(f"  🏠 Warming up: visiting {cfg.base_url} …")
+            home_page = ctx.new_page()
+            try:
+                home_page.goto(cfg.base_url, wait_until="domcontentloaded", timeout=30000)
+                time.sleep(random.uniform(3, 5))
+                cfg.log("  ✅ Homepage loaded — cookies set.")
+            except Exception as e:
+                cfg.log(f"  ⚠️ Homepage warm-up failed: {str(e)[:60]}")
+            finally:
+                home_page.close()
+
+            # Search templates for different Decathlon URL structures
+            templates = [
+                f"{cfg.base_url}/search?Ntt={quote(cfg.keyword)}&page={{p}}",
+                f"{cfg.base_url}/search?query={quote(cfg.keyword)}&page={{p}}",
+                f"{cfg.base_url}/search?q={quote(cfg.keyword)}&page={{p}}",
+                f"{cfg.base_url}/catalogsearch/result/?q={quote(cfg.keyword)}&p={{p}}",
+            ]
+
+            for page_num in range(1, cfg.max_pages + 1):
+                page_prods = None
+
+                for tmpl in templates:
+                    url = tmpl.format(p=page_num)
+                    cfg.log(f"  🔍 [PW] Page {page_num} → {url}")
+
+                    # Fresh page per attempt to avoid stale state
+                    page = ctx.new_page()
                     wait_s = random.uniform(*cfg.delay)
-                    cfg.log(f"  ⏱ Waiting {wait_s:.1f}s for JS render…")
-                    time.sleep(wait_s)
-                    _slow_scroll(page)
+                    html = _pw_get_html(page, url, wait_s, cfg.log)
+                    page.close()
 
-                    html = page.content()
+                    if not html:
+                        continue
+
                     page_prods = _extract_next_data(html, cfg.base_url, cfg.log)
                     if not page_prods:
                         cfg.log("  🔧 Trying HTML card parsing…")
                         page_prods = _parse_html_cards(html, cfg.base_url, cfg.log)
-                    if not page_prods:
-                        cfg.log("  ⛔ No products — stopping.")
-                        break
-                    products.extend(page_prods)
-                    cfg.log(f"  📊 Running total: {len(products)} products")
-                    time.sleep(random.uniform(*cfg.delay))
+
+                    if page_prods:
+                        break   # Found products — no need to try other URL templates
+
+                if not page_prods:
+                    cfg.log("  ⛔ No products on this page — stopping.")
+                    break
+
+                products.extend(page_prods)
+                cfg.log(f"  📊 Running total: {len(products)} products")
+                time.sleep(random.uniform(*cfg.delay))
 
             browser.close()
+
     except Exception as exc:
-        cfg.log(f"  ❌ Playwright error: {exc}")
+        cfg.log(f"  ❌ Playwright outer error: {exc}")
 
     return products
 
 # ═══════════════════════════════════════════════════════════
-# 9. MAIN ORCHESTRATOR
+# 9. ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════
 
 def run_scrape(cfg: ScrapeConfig) -> list:
     pages_label = "ALL" if cfg.max_pages == 9999 else str(cfg.max_pages)
     cfg.log(f"🚀 **{cfg.base_url}** | keyword: `{cfg.keyword}` | pages: {pages_label}")
     cfg.log("---")
-
     session  = create_session()
     products = []
 
-    # Strategy 1: Shopify (cloudscraper)
     result = cs_shopify(session, cfg)
     if result:
         products = result
-        cfg.log(f"✅ Shopify: {len(products)} products.")
+        cfg.log(f"✅ Shopify (cloudscraper): {len(products)} products.")
     else:
-        # Strategy 2: HTML (cloudscraper)
-        cfg.log("⚠️ Shopify failed. Trying HTML scraping…")
+        cfg.log("⚠️ Shopify blocked. Trying HTML scraping…")
         products = cs_html(session, cfg)
 
-    # Strategy 3: Playwright fallback (browser-based)
     if not products:
-        cfg.log("⚠️ Cloudscraper returned nothing. Launching Playwright browser…")
+        cfg.log("⚠️ Cloudscraper blocked. Launching Playwright browser…")
         cfg.log("---")
         products = pw_scrape(cfg)
 
@@ -596,7 +642,7 @@ def run_scrape(cfg: ScrapeConfig) -> list:
     return products
 
 # ═══════════════════════════════════════════════════════════
-# 10. EXPORT HELPERS
+# 10. EXPORTS
 # ═══════════════════════════════════════════════════════════
 
 def to_csv(df):
@@ -618,30 +664,28 @@ def to_excel(df):
 # ═══════════════════════════════════════════════════════════
 
 st.set_page_config(page_title="Decathlon Scraper", page_icon="🛒", layout="wide")
-
 st.title("🛒 Decathlon Scraper")
-st.caption("Shopify JSON → HTML scraping → Playwright browser fallback")
+st.caption("Shopify JSON → HTML → Playwright browser fallback")
 
-# Browser status
 if CHROMIUM_EXEC:
     st.success(f"✅ Playwright browser ready: `{CHROMIUM_EXEC}`")
 else:
-    st.warning("⚠️ Playwright browser not found — add `packages.txt` for JS-heavy sites. Cloudscraper will still run.")
+    st.warning("⚠️ Playwright browser not found. Add `packages.txt` for JS-heavy sites.")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
     country_label = st.selectbox("Country / Site", list(COUNTRIES.keys()))
     base_url      = COUNTRIES[country_label]
     st.caption(f"`{base_url}`")
-    keyword = st.text_input("Search keyword", value="cycle",
-                            help="Use the local language. e.g. 'cycle' for India, 'vélo' for France, 'Fahrrad' for Germany.")
+    keyword = st.text_input(
+        "Search keyword", value="cycle",
+        help="Use local language: 'cycle'/'bike' for UK/IN, 'vélo' for FR, 'Fahrrad' for DE"
+    )
     all_pages_toggle = st.toggle("📄 Scrape ALL pages", value=False)
+    max_pages = 9999 if all_pages_toggle else st.slider("Max pages", 1, 100, 5)
     if all_pages_toggle:
         st.caption("⚠️ No page limit.")
-        max_pages = 9999
-    else:
-        max_pages = st.slider("Max pages", 1, 100, 5)
-    delay_min, delay_max = st.slider("Delay between requests (s)", 0, 8, (2, 4))
+    delay_min, delay_max = st.slider("Delay between requests (s)", 1, 10, (2, 4))
     retries = st.slider("Retries per request", 1, 4, 2)
     st.divider()
     export_cols = st.multiselect("Export columns", ALL_EXPORT_COLUMNS,
@@ -665,7 +709,7 @@ if run_btn:
 
     def log(msg: str) -> None:
         log_lines.append(msg)
-        totals = [l for l in log_lines if "Running total:" in l or "unique products" in l]
+        totals = [l for l in log_lines if "total:" in l.lower() or "unique products" in l]
         if totals:
             status_box.info(f"⏳ {totals[-1].strip()}")
         log_box.markdown(
@@ -676,10 +720,8 @@ if run_btn:
         )
 
     cfg.log = log
-
     with st.spinner("Scraping…"):
         products = run_scrape(cfg)
-
     status_box.empty()
 
     if not products:
@@ -690,53 +732,49 @@ if run_btn:
     cols_present = [c for c in export_cols if c in df.columns]
     df_show = df[cols_present] if cols_present else df
 
-    st.success(f"✅ **{len(products)}** products via `{products[0].get('source_method', '?')}`")
+    st.success(f"✅ **{len(products)}** products via `{products[0].get('source_method','?')}`")
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Products", len(products))
-    c2.metric("Unique brands", len({p.get("brand", "") for p in products if p.get("brand")}))
-    valid_prices = []
+    c2.metric("Unique brands", len({p.get("brand","") for p in products if p.get("brand")}))
+    vp = []
     for p in products:
-        try: valid_prices.append(float(p["min_price"]))
+        try: vp.append(float(p["min_price"]))
         except Exception: pass
-    c3.metric("Avg price", f"{sum(valid_prices)/len(valid_prices):.2f}" if valid_prices else "—")
-    c4.metric("Min price", f"{min(valid_prices):.2f}" if valid_prices else "—")
-    c5.metric("Max price", f"{max(valid_prices):.2f}" if valid_prices else "—")
+    c3.metric("Avg price", f"{sum(vp)/len(vp):.2f}" if vp else "—")
+    c4.metric("Min price", f"{min(vp):.2f}" if vp else "—")
+    c5.metric("Max price", f"{max(vp):.2f}" if vp else "—")
 
     st.divider()
-
     b1, b2 = st.columns(2)
     with b1:
         aud = df["audience"].value_counts() if "audience" in df.columns else pd.Series()
         if not aud.empty:
-            st.markdown("**Audience breakdown**")
+            st.markdown("**Audience**")
             st.dataframe(aud.rename("count"), use_container_width=True)
     with b2:
         dep = df["department"].value_counts() if "department" in df.columns else pd.Series()
         if not dep.empty:
-            st.markdown("**Department breakdown**")
+            st.markdown("**Department**")
             st.dataframe(dep.rename("count"), use_container_width=True)
 
     st.divider()
-
     with st.expander("🖼️ Image preview (first 12)", expanded=False):
-        img_cols = st.columns(4)
+        ic = st.columns(4)
         shown = 0
         for p in products:
-            url = p.get("image_url_1", "")
+            url = p.get("image_url_1","")
             if url and shown < 12:
-                with img_cols[shown % 4]:
-                    try:
-                        st.image(url, caption=(p.get("title") or "")[:40], use_container_width=True)
-                    except Exception:
-                        st.write(p.get("title", ""))
+                with ic[shown % 4]:
+                    try: st.image(url, caption=(p.get("title",""))[:40], use_container_width=True)
+                    except Exception: st.write(p.get("title",""))
                 shown += 1
 
     st.subheader("📋 Results")
     st.dataframe(df_show, use_container_width=True, height=420)
 
     st.subheader("⬇️ Export")
-    fname = f"decathlon_{keyword.replace(' ', '_')}"
+    fname = f"decathlon_{keyword.replace(' ','_')}"
     d1, d2, d3 = st.columns(3)
     with d1:
         st.download_button("📄 CSV", to_csv(df_show), f"{fname}.csv", "text/csv", use_container_width=True)

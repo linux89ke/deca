@@ -7,6 +7,5 @@ openpyxl
 scikit-learn
 groq
 beautifulsoup4
-playwright
 cloudscraper
 lxml

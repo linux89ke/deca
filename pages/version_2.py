@@ -396,7 +396,8 @@ def _parse_html_card(card, base_url, selector):
 # ── Main scrape orchestrator ──────────────────────────────────────────────────
 
 def run_scrape(base_url, keyword, max_pages, delay, log):
-    log(f"🚀 Starting scrape: **{base_url}** | keyword: `{keyword}` | pages: {max_pages}")
+    pages_label = "ALL" if max_pages == 9999 else str(max_pages)
+    log(f"🚀 Starting scrape: **{base_url}** | keyword: `{keyword}` | pages: {pages_label}")
     log("---")
 
     # Method 1
@@ -462,8 +463,14 @@ with st.sidebar:
 
     keyword = st.text_input("Search keyword", value="vélo")
 
-    max_pages = st.slider("Max pages to scrape", 1, 20, 3,
-                          help="Each page ≈ 24 products")
+    all_pages = st.toggle("📄 Scrape ALL pages", value=False,
+                          help="Keeps going until no more products are found. Can take a while.")
+    if all_pages:
+        st.caption("⚠️ Will scrape until the site runs out of results. Use a generous delay.")
+        max_pages = 9999  # effectively unlimited; loop breaks when no products returned
+    else:
+        max_pages = st.slider("Max pages to scrape", 1, 100, 5,
+                              help="Each page ≈ 24 products. 100 pages ≈ 2,400 products.")
 
     delay_min, delay_max = st.slider(
         "Delay between requests (seconds)", 1, 10, (2, 4),
@@ -486,29 +493,52 @@ with st.sidebar:
     st.divider()
     run_btn = st.button("▶️ Start Scraping", type="primary", use_container_width=True)
 
+# expose to main block
+_all_pages = all_pages
+
 # ── Main area ─────────────────────────────────────────────────────────────────
 
 if run_btn:
     if not keyword.strip():
         st.error("Please enter a keyword.")
         st.stop()
+    all_pages = _all_pages
 
     log_messages = []
     log_box = st.empty()
-    progress = st.progress(0, text="Starting…")
+
+    if all_pages:
+        progress = st.empty()  # will show spinner text instead of bar
+        progress_bar = None
+    else:
+        progress_bar = st.progress(0, text="Starting…")
+        progress = None
+
+    stop_flag = {"stop": False}
 
     def log(msg):
         log_messages.append(msg)
+        # Count products found so far for live counter
+        found = sum(1 for m in log_messages if "total:" in m)
+        if all_pages and progress:
+            # Extract latest total from log
+            totals = [m for m in log_messages if "total:" in m]
+            total_so_far = totals[-1].split("total:")[-1].strip().rstrip(")") if totals else "0"
+            progress.info(f"⏳ Scraping… **{total_so_far} products** found so far (press Stop to cancel)")
         log_box.markdown(
             '<div style="background:#0e1117;padding:12px;border-radius:8px;'
             'font-family:monospace;font-size:12px;max-height:300px;overflow-y:auto;">'
-            + "<br>".join(log_messages[-30:]) +
+            + "<br>".join(log_messages[-40:]) +
             "</div>",
             unsafe_allow_html=True,
         )
 
     products = run_scrape(base_url, keyword.strip(), max_pages, (delay_min, delay_max), log)
-    progress.progress(100, text="Done.")
+
+    if all_pages and progress:
+        progress.empty()
+    if progress_bar:
+        progress_bar.progress(100, text="Done.")
 
     if not products:
         st.error("No products scraped. Check the log above.")
@@ -527,9 +557,12 @@ if run_btn:
     st.success(f"✅ Scraped **{len(products)}** products via `{products[0].get('source_method','?')}`")
 
     # ── Stats row
+    pages_actually_scraped = max(
+        int(len(products) / 24) + (1 if len(products) % 24 else 0), 1
+    )
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Products", len(products))
-    c2.metric("Pages scraped", max_pages)
+    c2.metric("Pages scraped", pages_actually_scraped)
     prices = [p["min_price"] for p in products if p.get("min_price") not in ("","",None)]
     c3.metric("Avg price (€)", f"{sum(float(x) for x in prices)/len(prices):.2f}" if prices else "—")
     brands = {p.get("brand","") for p in products if p.get("brand")}
